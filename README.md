@@ -1,4 +1,4 @@
-# NTFS3NT - NTFS File System Driver for Windows NT 3.1 - 4.0
+# NTFS3NT - NTFS File System Driver for Windows NT 3.1 / NT 3.5x / NT 4.0 / 2000
 
 NTFS3NT is a from-scratch NTFS driver that brings the **modern NTFS on-disk
 format** - the NTFS 3.x that Windows 2000 through Windows 11 write - to
