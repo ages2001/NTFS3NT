@@ -18,7 +18,7 @@ FLAGS="-c -ffreestanding -fno-stack-protector -fno-builtin -march=i486 -mtune=i4
 
 echo "Compiling driver sources..."
 rm -f "$OUT"/*.o
-for f in ntfsinit ntfsdisp ntfsio ntfsmft ntfsfsctl ntfscreate ntfsread ntfswrite ntfsclose ntfsdir ntfsinfo ntfsres ntfssup ntfscache ntfsalloc ntfsvol ntfsidx ntfsext; do
+for f in ntfsinit ntfsdisp ntfsio ntfsmft ntfsfsctl ntfscreate ntfsread ntfswrite ntfsclose ntfsdir ntfsinfo ntfsres ntfssup ntfscache ntfsalloc ntfsvol ntfsidx ntfsext ntfsjnl ntfssec ntfsea ntfsfeat; do
     $GCC $FLAGS $INC "$SRC/$f.c" -o "$OUT/$f.o"
 done
 $GCC $FLAGS $INC "$HERE/ntcrt.c" -o "$OUT/ntcrt.o"
@@ -32,7 +32,7 @@ $DLLTOOL --kill-at -d "$OUT/ntoskrnl.def" -l "$OUT/libntoskrnl_nt31.a"
 echo "Linking ntfs.sys (native, subsystem 3.10, base 0x10000)..."
 $GCC -shared -nostdlib -nostartfiles \
     -Wl,--subsystem,native -Wl,--major-subsystem-version,3 -Wl,--minor-subsystem-version,10 \
-    -Wl,--major-image-version,1 -Wl,--minor-image-version,0 \
+    -Wl,--major-image-version,1 -Wl,--minor-image-version,1 \
     -Wl,--major-os-version,1 -Wl,--minor-os-version,0 \
     -Wl,--image-base,0x10000 -Wl,--entry,_DriverEntry@8 -Wl,--file-alignment,0x200 \
     -o "$OUT/ntfs.sys" "$OUT"/*.o "$OUT/libntoskrnl_nt31.a" -lgcc

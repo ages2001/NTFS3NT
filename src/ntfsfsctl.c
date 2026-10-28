@@ -5,7 +5,71 @@
 
 #define NTFS_KERNEL
 #include "ntfs.h"
+#include "ntfsfeat.h"
 
+
+/* Locate $Secure and the \$Extend children, recording their MFT record numbers
+ * on the VCB (0 = absent). Called once at mount. */
+VOID
+NtfsDiscoverSpecialFiles(PNTFS_VCB Vcb)
+{
+    static const WCHAR nObjId[6]   = { '$','O','b','j','I','d' };
+    static const WCHAR nQuota[6]   = { '$','Q','u','o','t','a' };
+    static const WCHAR nReparse[8] = { '$','R','e','p','a','r','s','e' };
+    static const WCHAR nUsnJrnl[8] = { '$','U','s','n','J','r','n','l' };
+    PUCHAR rec;
+    ULONGLONG r;
+
+    rec = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, Vcb->Geo.MftRecordSize, NTFS_TAG_BUF);
+    if (rec == NULL) return;
+
+    /* $Secure (record 9): present when it has the $SDS data stream */
+    if (NT_SUCCESS(NtfsReadMftRecord(Vcb, MFT_RN_SECURE, rec)) &&
+        (((PMFT_RECORD)rec)->Flags & MFT_RECORD_IN_USE)) {
+        static const WCHAR sds[4] = { '$','S','D','S' };
+        if (NtfsFindAttribute((PMFT_RECORD)rec, ATTR_DATA, sds, 4))
+            Vcb->SecureRec = MFT_RN_SECURE;
+    }
+
+    /* \$Extend (record 11) and its children */
+    if (NT_SUCCESS(NtfsReadMftRecord(Vcb, MFT_RN_EXTEND, rec)) &&
+        (((PMFT_RECORD)rec)->Flags & MFT_RECORD_IN_USE) &&
+        (((PMFT_RECORD)rec)->Flags & MFT_RECORD_IS_DIRECTORY)) {
+        Vcb->ExtendRec = MFT_RN_EXTEND;
+        r = NtfsLookupInDir(Vcb, MFT_RN_EXTEND, nObjId, 6);
+        if (r != (ULONGLONG)-1) Vcb->ObjIdRec = r & 0xFFFFFFFFFFFFULL;
+        r = NtfsLookupInDir(Vcb, MFT_RN_EXTEND, nQuota, 6);
+        if (r != (ULONGLONG)-1) Vcb->QuotaRec = r & 0xFFFFFFFFFFFFULL;
+        r = NtfsLookupInDir(Vcb, MFT_RN_EXTEND, nReparse, 8);
+        if (r != (ULONGLONG)-1) Vcb->ReparseRec = r & 0xFFFFFFFFFFFFULL;
+        r = NtfsLookupInDir(Vcb, MFT_RN_EXTEND, nUsnJrnl, 8);
+        if (r != (ULONGLONG)-1) Vcb->UsnJrnlRec = r & 0xFFFFFFFFFFFFULL;
+    }
+
+    /* USN journal state from $UsnJrnl:$Max / :$J, if the journal exists */
+    if (Vcb->UsnJrnlRec &&
+        NT_SUCCESS(NtfsReadMftRecord(Vcb, Vcb->UsnJrnlRec, rec))) {
+        static const WCHAR nMax[4] = { '$','M','a','x' };
+        static const WCHAR nJ[2]   = { '$','J' };
+        PATTRIBUTE_RECORD mx = NtfsFindAttribute((PMFT_RECORD)rec, ATTR_DATA, nMax, 4);
+        PATTRIBUTE_RECORD j  = NtfsFindAttribute((PMFT_RECORD)rec, ATTR_DATA, nJ, 2);
+        if (mx && !mx->NonResident && NtfsResidentValueLength(mx) >= 32) {
+            PULONGLONG v = (PULONGLONG)NtfsResidentValue(mx);
+            Vcb->UsnMaxSize = v[0];
+            Vcb->UsnDelta   = v[1];
+            Vcb->UsnJournalId = v[3];
+        }
+        if (j) {
+            Vcb->UsnNext = j->NonResident ? j->Form.NonResident.DataSize
+                                          : NtfsResidentValueLength(j);
+            /* lowest valid USN = the first non-sparse byte; a full scan is the
+             * feature module's job, so start conservative */
+            Vcb->UsnLowest = 0;
+        }
+    }
+
+    ExFreePool(rec);
+}
 
 NTSTATUS
 NtfsMountVolume(PNTFS_IRP_CONTEXT Ctx)
@@ -48,6 +112,7 @@ NtfsMountVolume(PNTFS_IRP_CONTEXT Ctx)
     ExInitializeResourceLite(&Vcb->Resource);
     InitializeListHead(&Vcb->FcbList);
     KeInitializeEvent(&Vcb->MetaEvent, SynchronizationEvent, TRUE);
+    InitializeListHead(&Vcb->NotifyList);
     Vcb->MetaOwner = NULL;
     Vcb->MetaDepth = 0;
 
@@ -127,6 +192,16 @@ NtfsMountVolume(PNTFS_IRP_CONTEXT Ctx)
             Vcb->FreeClusters = NtfsCountFreeClusters(Vcb);
             NtfsLoadUpcase(Vcb);
         }
+
+        /* 3b. special metadata files, for security/object-id/USN/quota and the
+         *     journal. $Secure is record 9; $Extend (record 11) indexes the
+         *     rest by name. Absent ones stay 0. */
+        NtfsDiscoverSpecialFiles(Vcb);
+
+        /* 3c. journal: read $LogFile's restart area, replay our log if the
+         *     volume was not cleanly unmounted, then keep it while mounted for
+         *     write. A read-only mount or a missing/bad $LogFile leaves it off. */
+        NtfsJnlMount(Vcb, FALSE);
 
         /* 4. publish the mount */
         Vpb->DeviceObject = VolumeDevice;
@@ -239,6 +314,7 @@ NtfsCommonFileSystemControl(PNTFS_IRP_CONTEXT Ctx)
             return STATUS_SUCCESS;                     /* FSCTL_IS_PATHNAME_VALID */
         if (code == FSCTL_GET_REPARSE_POINT && !NTFS_IS_VOLUME_FO(Ctx))
             return NtfsGetReparsePoint(Ctx);
+        { NTSTATUS fst; if (NtfsFeatureFsctl(Ctx, code, &fst)) return fst; }
         return STATUS_INVALID_DEVICE_REQUEST;
     }
     }

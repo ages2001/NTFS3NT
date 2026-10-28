@@ -143,6 +143,19 @@ static NTSTATUS
 WriteBlk(PTREE t, ULONGLONG Vcn, PUCHAR Buf)
 {
     NTSTATUS st;
+    /* journal the INDX block (write-ahead undo): log its old image, logical
+     * (fixups not applied), so a crash mid-change can be rolled back. */
+    if (NtfsJnlInTx(t->Vcb)) {
+        PUCHAR Old = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, t->Ibs, NTFS_TAG_BUF);
+        if (Old) {
+            if (NT_SUCCESS(NtfsReadAttributeData(t->Vcb, t->Runs, t->Rc, Vcn * t->VcnBytes, t->Ibs, Old))) {
+                if (((PNTFS_RECORD_HEADER)Old)->Type == NTFS_INDX_SIGNATURE)
+                    NtfsApplyFixup(Old, t->Ibs, t->Vcb->Geo.BytesPerSector);
+                NtfsJnlRange(t->Vcb, 1 /*NTFS_JNL_INDEX*/, t->Dir, Vcn * t->VcnBytes, Old, Buf, t->Ibs);
+            }
+            ExFreePool(Old);
+        }
+    }
     NtfsSetFixup(Buf, t->Ibs, t->Vcb->Geo.BytesPerSector);
     st = NtfsWriteAttributeData(t->Vcb, t->Runs, t->Rc, Vcn * t->VcnBytes, t->Ibs, Buf);
     NtfsApplyFixup(Buf, t->Ibs, t->Vcb->Geo.BytesPerSector);

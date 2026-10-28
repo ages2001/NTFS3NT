@@ -48,7 +48,8 @@ LoadDataRuns(PNTFS_VCB Vcb, ULONGLONG RecNo, ULONG AttrType,
  * first bit index in *FirstBit. BitLimit caps the search (total clusters/records). */
 static NTSTATUS
 BitmapAllocRun(PNTFS_VCB Vcb, PNTFS_RUN Runs, ULONG RunCount, ULONGLONG BitmapBytes,
-               ULONG Count, ULONGLONG StartBit, ULONGLONG BitLimit, ULONGLONG *FirstBit)
+               ULONG Count, ULONGLONG StartBit, ULONGLONG BitLimit, ULONGLONG *FirstBit,
+               ULONG JnlKind)
 {
     PUCHAR bm;
     ULONG bmLen;
@@ -76,14 +77,19 @@ BitmapAllocRun(PNTFS_VCB Vcb, PNTFS_RUN Runs, ULONG RunCount, ULONGLONG BitmapBy
     }
     if (run < Count || found == (ULONGLONG)-1) { ExFreePool(bm); return STATUS_DISK_FULL; }
 
-    /* set the bits */
-    for (i = found; i < found + Count; i++) bm[i >> 3] |= (1u << (i & 7));
-
-    /* write back the affected byte range */
+    /* write back the affected byte range (journal its old image first) */
     {
         ULONGLONG b0 = found >> 3;
         ULONGLONG b1 = (found + Count - 1) >> 3;
         ULONG wlen = (ULONG)(b1 - b0 + 1);
+        PUCHAR old = NULL;
+        if (NtfsJnlInTx(Vcb)) {
+            old = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, wlen, NTFS_TAG_BUF);
+            if (old) RtlCopyMemory(old, bm + b0, wlen);    /* image BEFORE setting bits */
+        }
+        /* set the bits */
+        for (i = found; i < found + Count; i++) bm[i >> 3] |= (1u << (i & 7));
+        if (old) { NtfsJnlRange(Vcb, JnlKind, 0, b0, old, bm + b0, wlen); ExFreePool(old); }
         Status = NtfsWriteAttributeData(Vcb, Runs, RunCount, b0, wlen, bm + b0);
     }
     ExFreePool(bm);
@@ -94,12 +100,12 @@ BitmapAllocRun(PNTFS_VCB Vcb, PNTFS_RUN Runs, ULONG RunCount, ULONGLONG BitmapBy
 /* generic bitmap free: clear Count bits starting at bit, write them back. */
 static NTSTATUS
 BitmapFreeRun(PNTFS_VCB Vcb, PNTFS_RUN Runs, ULONG RunCount, ULONGLONG BitmapBytes,
-              ULONGLONG StartBit, ULONG Count)
+              ULONGLONG StartBit, ULONG Count, ULONG JnlKind)
 {
     ULONGLONG b0 = StartBit >> 3;
     ULONGLONG b1 = (StartBit + Count - 1) >> 3;
     ULONG wlen = (ULONG)(b1 - b0 + 1);
-    PUCHAR buf;
+    PUCHAR buf, old = NULL;
     ULONGLONG i;
     NTSTATUS Status;
 
@@ -109,8 +115,13 @@ BitmapFreeRun(PNTFS_VCB Vcb, PNTFS_RUN Runs, ULONG RunCount, ULONGLONG BitmapByt
     if (buf == NULL) return STATUS_INSUFFICIENT_RESOURCES;
     Status = NtfsReadAttributeData(Vcb, Runs, RunCount, b0, wlen, buf);
     if (NT_SUCCESS(Status)) {
+        if (NtfsJnlInTx(Vcb)) {
+            old = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, wlen, NTFS_TAG_BUF);
+            if (old) RtlCopyMemory(old, buf, wlen);        /* image BEFORE clearing bits */
+        }
         for (i = StartBit; i < StartBit + Count; i++)
             buf[(i >> 3) - b0] &= ~(1u << (i & 7));
+        if (old) { NtfsJnlRange(Vcb, JnlKind, 0, b0, old, buf, wlen); ExFreePool(old); }
         Status = NtfsWriteAttributeData(Vcb, Runs, RunCount, b0, wlen, buf);
     }
     ExFreePool(buf);
@@ -153,7 +164,7 @@ NtfsAllocClusters(PNTFS_VCB Vcb, ULONG Count, ULONGLONG *FirstLcn)
     Status = LoadDataRuns(Vcb, MFT_RN_BITMAP, ATTR_DATA, NULL, 0, &runs, &rc, &bytes);
     if (NT_SUCCESS(Status)) {
         Status = BitmapAllocRun(Vcb, runs, rc, bytes, Count, 0,
-                                Vcb->Geo.TotalClusters, FirstLcn);
+                                Vcb->Geo.TotalClusters, FirstLcn, NTFS_JNL_BITMAP);
         ExFreePool(runs);
         if (NT_SUCCESS(Status) && Vcb->FreeClusters >= Count) Vcb->FreeClusters -= Count;
     }
@@ -217,9 +228,9 @@ NtfsAllocClustersNear(PNTFS_VCB Vcb, ULONG Count, ULONGLONG Hint, ULONGLONG *Fir
     NTFS_LOCK_META(Vcb);
     Status = LoadDataRuns(Vcb, MFT_RN_BITMAP, ATTR_DATA, NULL, 0, &runs, &rc, &bytes);
     if (NT_SUCCESS(Status)) {
-        Status = BitmapAllocRun(Vcb, runs, rc, bytes, Count, Hint, Vcb->Geo.TotalClusters, FirstLcn);
+        Status = BitmapAllocRun(Vcb, runs, rc, bytes, Count, Hint, Vcb->Geo.TotalClusters, FirstLcn, NTFS_JNL_BITMAP);
         if (Status == STATUS_DISK_FULL)
-            Status = BitmapAllocRun(Vcb, runs, rc, bytes, Count, 0, Vcb->Geo.TotalClusters, FirstLcn);
+            Status = BitmapAllocRun(Vcb, runs, rc, bytes, Count, 0, Vcb->Geo.TotalClusters, FirstLcn, NTFS_JNL_BITMAP);
         ExFreePool(runs);
         if (NT_SUCCESS(Status) && Vcb->FreeClusters >= Count) Vcb->FreeClusters -= Count;
     }
@@ -235,7 +246,7 @@ NtfsFreeClusters(PNTFS_VCB Vcb, ULONGLONG FirstLcn, ULONG Count)
     NTFS_LOCK_META(Vcb);
     Status = LoadDataRuns(Vcb, MFT_RN_BITMAP, ATTR_DATA, NULL, 0, &runs, &rc, &bytes);
     if (NT_SUCCESS(Status)) {
-        Status = BitmapFreeRun(Vcb, runs, rc, bytes, FirstLcn, Count);
+        Status = BitmapFreeRun(Vcb, runs, rc, bytes, FirstLcn, Count, NTFS_JNL_BITMAP);
         ExFreePool(runs);
         if (NT_SUCCESS(Status)) Vcb->FreeClusters += Count;
     }
@@ -402,7 +413,7 @@ NtfsAllocMftRecord(PNTFS_VCB Vcb, ULONGLONG *RecordNumber)
             ULONGLONG limit = bytes * 8;
             if (limit > Vcb->MftRecordCount) limit = Vcb->MftRecordCount;
             Status = BitmapAllocRun(Vcb, runs, rc, bytes, 1,
-                                    NTFS_FIRST_USER_MFT, limit, RecordNumber);
+                                    NTFS_FIRST_USER_MFT, limit, RecordNumber, NTFS_JNL_MFTBMP);
         }
         ExFreePool(runs);
         if (Status != STATUS_DISK_FULL || pass == 1) break;
@@ -422,7 +433,7 @@ NtfsFreeMftRecord(PNTFS_VCB Vcb, ULONGLONG RecordNumber)
     NTFS_LOCK_META(Vcb);
     Status = LoadDataRuns(Vcb, MFT_RN_MFT, ATTR_BITMAP, NULL, 0, &runs, &rc, &bytes);
     if (NT_SUCCESS(Status)) {
-        Status = BitmapFreeRun(Vcb, runs, rc, bytes, RecordNumber, 1);
+        Status = BitmapFreeRun(Vcb, runs, rc, bytes, RecordNumber, 1, NTFS_JNL_MFTBMP);
         ExFreePool(runs);
     }
     NTFS_UNLOCK_META(Vcb);

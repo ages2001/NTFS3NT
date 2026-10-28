@@ -1,5 +1,27 @@
 NTFS3NT - Changelog
 
+v1.1.0.0
+Changelog:
+- Journaling (crash recovery). The driver now keeps a private UNDO journal inside the volume's $LogFile: before any metadata change (MFT records, directory $INDX blocks, the $Bitmap and $MFT:$BITMAP allocation bitmaps) it logs the old bytes write-ahead, and at mount it rolls back any transaction that had not committed when power was lost. A dirty marker is cleared on an orderly shutdown (IoRegisterShutdownNotification), so a clean stop needs no replay. For interop the Windows LFS restart pages are always written back clean and the $Volume dirty bit is set while work is in flight, so Windows' own chkdsk still has a consistent fallback. File create/delete/rename, writes, truncate/extend, security, EA, reparse, object-id and hard-link operations all run inside a journal transaction.
+- Transparent LZNT1 compression, read and write. Compressed files are read on every supported OS (as before). New: writing to a compressed file transparently decompresses it first (the file becomes plain, so no data is lost), and FSCTL_SET_COMPRESSION / FSCTL_GET_COMPRESSION are implemented - compressing a file produces a standard LZNT1 compressed $DATA (per-compression-unit: compressed clusters plus a sparse hole, or a full unit stored raw) that ntfs-3g and Windows read back byte-for-byte.
+- Security descriptors (ACLs). IRP_MJ_QUERY_SECURITY / IRP_MJ_SET_SECURITY read and store a file's $SECURITY_DESCRIPTOR (owner, group, DACL, SACL), through the $Secure:$SDS stream when the file references a shared descriptor by SecurityId, else the file's own resident descriptor. FILE_PERSISTENT_ACLS is now advertised.
+- Extended attributes. IRP_MJ_QUERY_EA / IRP_MJ_SET_EA read and write a file's $EA / $EA_INFORMATION (full/overwrite set), replacing the earlier STATUS_EAS_NOT_SUPPORTED stub.
+- Reparse points. FSCTL_SET_REPARSE_POINT / FSCTL_GET_REPARSE_POINT / FSCTL_DELETE_REPARSE_POINT and the open path now handle $REPARSE_POINT: a name-surrogate tag (symlink/junction) returns STATUS_REPARSE with the reparse data unless FILE_OPEN_REPARSE_POINT was asked. FILE_SUPPORTS_REPARSE_POINTS is advertised.
+- Hard links (FileLinkInformation / the Win32 CreateHardLink path): a second $FILE_NAME is added and indexed and the link count bumped.
+- Sparse files. FSCTL_SET_SPARSE, FSCTL_QUERY_ALLOCATED_RANGES and FSCTL_SET_ZERO_DATA are implemented; FILE_SUPPORTS_SPARSE_FILES is advertised.
+- Object IDs. FSCTL_SET/GET/DELETE_OBJECT_ID and CREATE_OR_GET_OBJECT_ID read and store a file's $OBJECT_ID. The volume now advertises FILE_SUPPORTS_OBJECT_IDS, which is what fsutil checks before it will touch object ids (without it fsutil reported "requires a local NTFS volume").
+- Volume and defrag control codes: FSCTL_GET_NTFS_VOLUME_DATA, FSCTL_GET_NTFS_FILE_RECORD, FSCTL_GET_VOLUME_BITMAP, FSCTL_GET_RETRIEVAL_POINTERS and FSCTL_QUERY_USN_JOURNAL.
+- EFS-encrypted files are preserved rather than corrupted: the $EFS attribute and the encrypted $DATA are kept intact, the file shows as encrypted, reads return the stored ciphertext, and a write is refused (the driver has no EFS key handling, so writing plaintext would destroy the ciphertext). This is data-preserving passthrough, not independent EFS encryption/decryption.
+- FILE_FS_ATTRIBUTE_INFORMATION now reports the capabilities the driver actually implements (case-sensitive search, case-preserved, Unicode on disk, persistent ACLs, sparse files, reparse points, object ids, named streams) so capability-gated tools accept the volume.
+- Fixed 0x0000001E (KMODE_EXCEPTION_NOT_HANDLED) BSOD in Ntfs.sys as soon as File Manager or Explorer opened a folder: a trace in the request dispatcher read the change-notification filter as if it were a file name.
+- Added byte-range locks (LockFile/UnlockFile). WritePrivateProfileString and programs that lock files failed on NTFS volumes on NT 3.51 and 4.0.
+- Held change notifications are now completed when their handle is closed and when the volume is dismounted, and a cancelled one leaves the volume's list.
+- ntfschk and ntfsfmt use only functions Windows NT 3.1 has (SetFilePointer, GetSystemTime); they would not start there.
+- ntfsinst finds ntfs.sys next to itself; run from another folder (a floppy, say) it failed with error 2.
+- Added Windows 2000 and Windows XP support (x86 and x64). The i386 ntfs.sys runs on NT 3.1 - 4.0, 2000 and XP; a new amd64 ntfs.sys (build/build_amd64.sh) runs on XP x64 and Server 2003 x64. bin\ now holds i386\ and amd64\ folders, each with the driver and all tools.
+- ntfsinst on Windows 2000 and XP copies the driver as drivers\ntfs3nt.sys and points the Ntfs service's ImagePath at it, leaving Windows' own Ntfs.sys untouched (Windows File Protection would put it back at once); it refuses to take over an NTFS system volume unless /FORCE is given. ntfsinst /U gives the Ntfs service its own driver back.
+- Fixed data loss when a deleted file's cached pages were written out late: the cache could still hold dirty pages of a deleted file (data that went to the disk and into the cache as well), and the lazy writer wrote them later over the clusters the file had given back - into whatever file got them next. A deleted file's pages are now dropped before its clusters are freed, and a paging write to a deleted or replaced file goes nowhere.
+
 v1.0.0.0
 Changelog:
 - Initial Release.

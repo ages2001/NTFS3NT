@@ -34,6 +34,17 @@ NtfsWriteMftRecord(PNTFS_VCB Vcb, ULONGLONG RecordNumber, PVOID Buffer)
 {
     ULONGLONG Vbo = RecordNumber * (ULONGLONG)Vcb->Geo.MftRecordSize;
     NTSTATUS Status;
+    /* journal (write-ahead): log the record's old image before it changes, and
+     * let the journal stamp a $LogFile LSN into the new one. Only inside a
+     * transaction; the journal's own writes run outside one and are not logged. */
+    if (NtfsJnlInTx(Vcb)) {
+        PUCHAR OldImg = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, Vcb->Geo.MftRecordSize, NTFS_TAG_BUF);
+        if (OldImg) {
+            PVOID old = NT_SUCCESS(NtfsReadMftRecord(Vcb, RecordNumber, OldImg)) ? (PVOID)OldImg : NULL;
+            NtfsJnlRecord(Vcb, RecordNumber, old, Buffer);
+            ExFreePool(OldImg);
+        }
+    }
     NtfsSetFixup(Buffer, Vcb->Geo.MftRecordSize, Vcb->Geo.BytesPerSector);
     Status = NtfsWriteAttributeData(Vcb, Vcb->MftRuns, Vcb->MftRunCount,
                                     Vbo, Vcb->Geo.MftRecordSize, Buffer);
@@ -81,6 +92,7 @@ NtfsCreateFcb(PNTFS_VCB Vcb, ULONGLONG RecordNumber)
     ExInitializeResourceLite(&Fcb->PagingIoResource);
     Fcb->Header.Resource = &Fcb->Resource;
     Fcb->Header.PagingIoResource = &Fcb->PagingIoResource;
+    FsRtlInitializeFileLock(&Fcb->FileLock, NULL, NULL);
     Fcb->Header.NodeTypeCode = NTFS_NTC_FCB;
     Fcb->Header.NodeByteSize = sizeof(NTFS_FCB);
     InsertTailList(&Vcb->FcbList, &Fcb->FcbLinks);
@@ -97,6 +109,7 @@ NtfsDeleteFcb(PNTFS_FCB Fcb)
     if (Fcb->ResidentData) {
         ExFreePool(Fcb->ResidentData);
     }
+    FsRtlUninitializeFileLock(&Fcb->FileLock);
     ExDeleteResourceLite(&Fcb->Resource);
     ExDeleteResourceLite(&Fcb->PagingIoResource);
     ExFreePool(Fcb);

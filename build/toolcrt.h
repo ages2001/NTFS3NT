@@ -11,7 +11,14 @@
 #ifndef NULL
 #define NULL ((void*)0)
 #endif
+#ifndef _TIME_T_DEFINED
+#define _TIME_T_DEFINED
+#ifdef _WIN64
+typedef long long time_t;
+#else
 typedef long time_t;
+#endif
+#endif
 
 struct tm {
     int tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year,

@@ -224,6 +224,44 @@ def main():
                     print("FAILED: btree (volume not clean)"); sys.exit(1)
             print("btree: OK (multi-level index insert/split/delete/merge, invariants + ntfsfix)")
 
+        # transparent LZNT1 compression (the COMPRESS direction): compress a
+        # plain file into an image with the driver's own layout (ntfsmkcomp uses
+        # src/ntfssup.c: NtfsLznt1CompressUnit + NtfsSetBaseDataRuns) and check
+        # ntfs-3g reads every byte back - proves the on-disk compressed attribute
+        # and runs are what a real NTFS reader expects.
+        if shutil.which("ntfscp") and shutil.which("ntfsls"):
+            cexe = os.path.join(tmp, "ntfsmkcomp")
+            run(["cc", "-O1", "-w", "-I", SRC, os.path.join(HERE, "ntfsmkcomp.c"),
+                 os.path.join(SRC, "ntfssup.c"), "-o", cexe])
+            payloads = {
+                "text":   b"The quick brown fox jumps over the lazy dog. " * 8000,
+                "zeros":  bytes(200000),
+                "random": os.urandom(100000),
+                "small":  b"A" * 60000,
+            }
+            for name, data in payloads.items():
+                cimg = os.path.join(tmp, "cmp.img")
+                if os.path.exists(cimg): os.remove(cimg)
+                with open(cimg, "wb") as f: f.truncate(80 * 1024 * 1024)
+                run(["mkntfs", "-Q", "-F", "-c", "4096", "-L", "CMP", cimg])
+                pf = os.path.join(tmp, "p.bin")
+                with open(pf, "wb") as f: f.write(data)
+                run(["ntfscp", cimg, pf, "c.bin"])
+                inode = None
+                for line in run(["ntfsls", "-i", cimg]).stdout.splitlines():
+                    if "c.bin" in line: inode = line.split()[0]
+                run([cexe, cimg, inode])
+                mp = os.path.join(tmp, "cmnt"); os.makedirs(mp, exist_ok=True)
+                try:
+                    run(["ntfs-3g", cimg, mp])
+                    with open(os.path.join(mp, "c.bin"), "rb") as f: back = f.read()
+                finally:
+                    subprocess.run(["fusermount", "-u", mp])
+                if back != data:
+                    print("FAILED: compression (%s: ntfs-3g read-back differs)" % name); sys.exit(1)
+            print("compression: OK (LZNT1 compress -> ntfs-3g reads back identical: %s)"
+                  % ", ".join(payloads))
+
         print("ALL PASS")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

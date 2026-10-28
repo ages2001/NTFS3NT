@@ -144,6 +144,7 @@ NtfsVolumeFsctl(PNTFS_IRP_CONTEXT Ctx, NTSTATUS *Out)
         if (!((Vcb->VcbState & VCB_STATE_LOCKED) && Vcb->LockFileObject == FileObject) &&
             Vcb->OpenCount > 1) { *Out = STATUS_ACCESS_DENIED; return TRUE; }
         Vcb->VcbState |= VCB_STATE_DISMOUNTED;
+        NtfsNotifyCleanup(Vcb, NULL);
         /* the next open of the device mounts afresh (e.g. after a format) */
         IoAcquireVpbSpinLock(&irql);
         Vcb->Vpb->Flags &= ~VPB_MOUNTED;

@@ -104,6 +104,9 @@ void NtfsBuildFileRecord(PVOID Buf, ULONG RecSize, ULONG SecSize,
 BOOLEAN NtfsConvertDataToNonResident(PMFT_RECORD m, ULONG RecSize, ULONGLONG Lcn,
                                      ULONGLONG Clusters, ULONGLONG AllocSize,
                                      ULONGLONG DataSize);
+BOOLEAN NtfsSetBaseDataRuns(PMFT_RECORD m, ULONG RecSize, PNTFS_RUN Runs, ULONG Rc,
+                            ULONGLONG AllocSize, ULONGLONG DataSize, ULONG CompUnit,
+                            ULONGLONG CompressedBytes);
 /* Insert/remove an index entry in a SMALL (resident) $INDEX_ROOT $I30. */
 BOOLEAN NtfsIndexRootInsert(PMFT_RECORD m, ULONG RecSize, const void *Entry, ULONG EntryLen);
 BOOLEAN NtfsIndexRootRemove(PMFT_RECORD m, ULONG RecSize, const WCHAR *Name, ULONG NameLen);
@@ -149,6 +152,7 @@ void NtfsBuildDirRecord(PVOID Buf, ULONG RecSize, ULONG SecSize, ULONGLONG RecNo
 BOOLEAN NtfsIsDos83Name(const WCHAR *Name, ULONG Len);
 BOOLEAN NtfsInsertAttributeEx(PMFT_RECORD m, ULONG RecSize, const void *Attr, ULONG Len, BOOLEAN First);
 BOOLEAN NtfsInsertAttribute(PMFT_RECORD m, ULONG RecSize, const void *Attr, ULONG Len);
+void NtfsRemoveAttribute(PMFT_RECORD m, PATTRIBUTE_RECORD a);
 PINDEX_ENTRY NtfsFindIndexEntry(PINDEX_HEADER Header, const WCHAR *Name, ULONG NameLen);
 BOOLEAN NtfsPromoteRootToLarge(PMFT_RECORD m, ULONG RecSize, PUCHAR Leaf, ULONG ibs,
                                ULONG SecSize, ULONGLONG Lcn, ULONGLONG Clusters,
@@ -171,5 +175,6 @@ ULONGLONG NtfsIndexSubnodeVcn(PINDEX_ENTRY Entry);
  * (compressed) bytes of one compression unit; Out is filled to OutMax (unit
  * size) and zero-padded. Returns OutMax. */
 ULONG NtfsLznt1Unit(const unsigned char *In, ULONG InLen, unsigned char *Out, ULONG OutMax);
+ULONG NtfsLznt1CompressUnit(const unsigned char *In, ULONG UnitLen, unsigned char *Out, ULONG OutMax, unsigned char *Body);
 
 #endif /* _NTFSSUP_H_ */

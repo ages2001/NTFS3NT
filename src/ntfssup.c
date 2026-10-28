@@ -5,7 +5,7 @@
  * the driver, the tools and the Linux test.
  */
 
-#if defined(NTFS_CROSS) || defined(NTFS_KERNEL)
+#if defined(NTFS_CROSS) || defined(NTFS_AMD64) || defined(NTFS_KERNEL)
 #include "ntfs.h"
 #else
 #include "ntfsusr.h"
@@ -521,6 +521,69 @@ NtfsSetDataSize(PMFT_RECORD m, ULONGLONG DataSize)
 }
 
 /*
+ * Rewrite the unnamed non-resident $DATA of record m with a complete run list
+ * (sparse runs allowed) in the base record. CompUnit != 0 writes a compressed
+ * attribute (flag set, CompressedSize field at 0x40, mapping at 0x48); 0 writes
+ * a plain attribute (mapping at 0x40). Returns FALSE if the mapping does not fit
+ * the base record (caller must keep the old layout). Pure memory work.
+ */
+BOOLEAN
+NtfsSetBaseDataRuns(PMFT_RECORD m, ULONG RecSize, PNTFS_RUN Runs, ULONG Rc,
+                    ULONGLONG AllocSize, ULONGLONG DataSize, ULONG CompUnit,
+                    ULONGLONG CompressedBytes)
+{
+    PATTRIBUTE_RECORD a = NtfsFindAttribute(m, ATTR_DATA, NULL, 0);
+    UCHAR mp[1024];
+    ULONG mpLen, mpOff, newLen, oldLen, recUsed, attrOff, attrEnd, tail;
+    ULONG type; USHORT id;
+    LONG delta;
+    PUCHAR ra;
+    ULONGLONG highVcn;
+
+    if (a == NULL || !a->NonResident || Rc == 0) return FALSE;
+    mpOff = CompUnit ? 0x48 : 0x40;                 /* compressed header carries CompressedSize */
+    if (!NtfsEncodeRuns(Runs, Rc, mp, sizeof(mp), &mpLen)) return FALSE;
+
+    ra = (PUCHAR)a;
+    oldLen = a->Length;
+    newLen = (mpOff + mpLen + 7) & ~7u;
+    delta = (LONG)newLen - (LONG)oldLen;
+    recUsed = m->BytesInUse;
+    if ((LONG)recUsed + delta > (LONG)RecSize) return FALSE;
+
+    attrOff = (ULONG)(ra - (PUCHAR)m);
+    attrEnd = attrOff + oldLen;
+    tail = recUsed - attrEnd;
+    if (delta != 0 && tail > 0) memmove(ra + newLen, ra + oldLen, tail);
+
+    type = a->Type; id = a->AttributeId;
+    highVcn = Runs[Rc - 1].Vcn + Runs[Rc - 1].Length - 1;
+    RtlZeroMemory(ra, newLen);
+    a->Type = type;
+    a->Length = newLen;
+    a->NonResident = 1;
+    a->NameLength = 0;
+    a->NameOffset = (USHORT)mpOff;
+    a->Flags = CompUnit ? 0x0001 : 0;               /* ATTRIBUTE_FLAG_COMPRESSED */
+    a->AttributeId = id;
+    a->Form.NonResident.LowestVcn = 0;
+    a->Form.NonResident.HighestVcn = highVcn;
+    a->Form.NonResident.MappingPairsOffset = (USHORT)mpOff;
+    a->Form.NonResident.CompressionUnit = (UCHAR)CompUnit;
+    /* For a compressed attribute the 0x28 AllocatedSize is the full VCN span
+     * (what ntfs-3g/Windows expect) and the real on-disk clusters go in the
+     * 0x40 CompressedSize field. For a plain attribute AllocatedSize is the
+     * real allocation and there is no 0x40 field. */
+    a->Form.NonResident.AllocatedSize = AllocSize;
+    a->Form.NonResident.DataSize = DataSize;
+    a->Form.NonResident.InitializedSize = DataSize;
+    if (CompUnit) *(ULONGLONG *)(ra + 0x40) = CompressedBytes;   /* CompressedSize (TotalAllocated) */
+    RtlCopyMemory(ra + mpOff, mp, mpLen);
+    m->BytesInUse = (ULONG)((LONG)recUsed + delta);
+    return TRUE;
+}
+
+/*
  * Convert the unnamed resident $DATA of record m into a non-resident attribute
  * backed by a single run (Lcn, Clusters). The record is rewritten in place
  * (the attribute's following neighbours shift and BytesInUse updates). The
@@ -997,6 +1060,85 @@ NtfsLznt1Unit(const UCHAR *In, ULONG InLen, UCHAR *Out, ULONG OutMax)
 }
 
 /* ------------------------------------------------------------------ */
+/* LZNT1 compression (symmetric with the decompressor above)           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Compress one <=4 KB chunk body. Returns the compressed body length, or 0 if
+ * it would not fit in OutMax (caller then stores the chunk uncompressed). The
+ * length/offset split tracks the output position exactly as the decompressor
+ * recomputes it, so every back-reference this emits decodes identically.
+ */
+static ULONG
+NtfsLznt1CompressChunk(const UCHAR *In, ULONG InLen, UCHAR *Out, ULONG OutMax)
+{
+    ULONG pos = 0, op = 0;
+    while (pos < InLen) {
+        ULONG flagPos = op++;
+        UCHAR flags = 0;
+        int b;
+        if (op > OutMax) return 0;
+        for (b = 0; b < 8 && pos < InLen; b++) {
+            ULONG index, lmask, dshift, maxdelta, maxlen, bestlen = 0, bestdelta = 0, j, start;
+            if (pos == 0) { if (op >= OutMax) return 0; Out[op++] = In[pos++]; continue; }
+            index = pos - 1; lmask = 0xFFF; dshift = 12;
+            while (index >= 0x10) { lmask >>= 1; dshift--; index >>= 1; }
+            maxdelta = 1u << (16 - dshift);
+            maxlen = lmask + 3;
+            start = (pos > maxdelta) ? pos - maxdelta : 0;
+            for (j = start; j < pos; j++) {
+                ULONG l = 0;
+                while (pos + l < InLen && l < maxlen && In[j + l] == In[pos + l]) l++;
+                if (l > bestlen) { bestlen = l; bestdelta = pos - j; }
+            }
+            if (bestlen >= 3) {
+                USHORT pair = (USHORT)(((bestdelta - 1) << dshift) | (bestlen - 3));
+                if (op + 2 > OutMax) return 0;
+                Out[op++] = (UCHAR)(pair & 0xFF); Out[op++] = (UCHAR)(pair >> 8);
+                flags |= (1 << b); pos += bestlen;
+            } else {
+                if (op >= OutMax) return 0;
+                Out[op++] = In[pos++];
+            }
+        }
+        Out[flagPos] = flags;
+    }
+    return op;
+}
+
+/*
+ * Compress one compression unit (UnitLen uncompressed bytes In[]) into Out[]
+ * (OutMax bytes). 'Body' is a >=4096-byte scratch buffer the caller owns (kept
+ * off the small kernel stack). Returns the compressed byte count. The caller
+ * compares that against the unit size to decide whether to store the unit
+ * compressed (with a trailing sparse hole) or uncompressed.
+ */
+ULONG
+NtfsLznt1CompressUnit(const UCHAR *In, ULONG UnitLen, UCHAR *Out, ULONG OutMax, UCHAR *Body)
+{
+    ULONG ip = 0, op = 0;
+    while (ip < UnitLen) {
+        ULONG clen = (UnitLen - ip > 4096) ? 4096 : (UnitLen - ip);
+        ULONG blen; USHORT hdr;
+        if (op + 2 > OutMax) return 0xFFFFFFFFUL;
+        blen = NtfsLznt1CompressChunk(In + ip, clen, Body, clen);
+        if (blen == 0 || blen >= clen) {                 /* no gain: store raw */
+            if (op + 2 + clen > OutMax) return 0xFFFFFFFFUL;
+            hdr = (USHORT)(0x3000 | (clen - 1));
+            Out[op++] = (UCHAR)(hdr & 0xFF); Out[op++] = (UCHAR)(hdr >> 8);
+            RtlCopyMemory(Out + op, In + ip, clen); op += clen;
+        } else {
+            if (op + 2 + blen > OutMax) return 0xFFFFFFFFUL;
+            hdr = (USHORT)(0xB000 | (blen - 1));         /* 0x3000 sig | 0x8000 compressed */
+            Out[op++] = (UCHAR)(hdr & 0xFF); Out[op++] = (UCHAR)(hdr >> 8);
+            RtlCopyMemory(Out + op, Body, blen); op += blen;
+        }
+        ip += clen;
+    }
+    return op;
+}
+
+/* ------------------------------------------------------------------ */
 /* Directory records, attribute insertion, SMALL->LARGE index growth   */
 /* ------------------------------------------------------------------ */
 
@@ -1097,6 +1239,17 @@ NtfsInsertAttributeEx(PMFT_RECORD m, ULONG RecSize, const void *Attr, ULONG Len,
     ((PATTRIBUTE_RECORD)(p + off))->AttributeId = m->NextAttributeId++;
     m->BytesInUse = used + Len;
     return TRUE;
+}
+
+/* Remove attribute `a` from record `m`, closing the gap. */
+void
+NtfsRemoveAttribute(PMFT_RECORD m, PATTRIBUTE_RECORD a)
+{
+    PUCHAR p = (PUCHAR)m, at = (PUCHAR)a;
+    ULONG len = a->Length, end = (ULONG)(at - p) + len;
+    if (len == 0 || end > m->BytesInUse) return;
+    memmove(at, at + len, m->BytesInUse - end);
+    m->BytesInUse -= len;
 }
 
 /* Find an index entry by (case-insensitive) name in one node. */

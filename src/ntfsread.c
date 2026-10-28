@@ -48,6 +48,11 @@ NtfsCommonRead(PNTFS_IRP_CONTEXT Ctx)
     if (Length == 0) {
         return STATUS_SUCCESS;
     }
+    /* a byte range another handle has locked */
+    if (!(Ctx->Irp->Flags & IRP_PAGING_IO) && Fcb->NodeTypeCode == NTFS_NTC_FCB &&
+        !FsRtlCheckLockForReadAccess(&Fcb->FileLock, Ctx->Irp)) {
+        return STATUS_FILE_LOCK_CONFLICT;
+    }
 
     /* ---- named $DATA stream (ADS): served directly from the CCB ---------- */
     if (Ccb && Ccb->NodeTypeCode == NTFS_NTC_CCB && Ccb->NamedStream) {

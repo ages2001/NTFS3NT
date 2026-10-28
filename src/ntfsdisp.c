@@ -55,9 +55,32 @@ NtfsGuardedDispatch(PNTFS_IRP_CONTEXT Ctx)
         return NtfsCommonQueryVolumeInformation(Ctx);
     case IRP_MJ_FILE_SYSTEM_CONTROL:
         return NtfsCommonFileSystemControl(Ctx);
+    case IRP_MJ_LOCK_CONTROL:
+        return NtfsCommonLockControl(Ctx);
+    case IRP_MJ_QUERY_EA:
+        return NtfsQueryEa(Ctx);
+    case IRP_MJ_SET_EA:
+        return NtfsSetEa(Ctx);
     case IRP_MJ_FLUSH_BUFFERS:          /* file data and metadata are written through */
-    case IRP_MJ_SHUTDOWN:
         return STATUS_SUCCESS;
+    case IRP_MJ_SHUTDOWN: {
+        /* system is going down: mark each volume's log clean, so next boot
+         * needs no replay and Windows runs no chkdsk. */
+        PLIST_ENTRY e;
+        (VOID)ExAcquireResourceExclusiveLite(&NtfsData.Resource, TRUE);
+        for (e = NtfsData.VcbList.Flink; e != &NtfsData.VcbList; e = e->Flink) {
+            PNTFS_VCB v = CONTAINING_RECORD(e, NTFS_VCB, VcbLinks);
+            if (NtfsJnlActive(v)) NtfsJnlUnmount(v, TRUE);
+        }
+        ExReleaseResourceForThreadLite(&NtfsData.Resource, ExGetCurrentResourceThread());
+        return STATUS_SUCCESS;
+    }
+#ifdef IRP_MJ_QUERY_SECURITY
+    case IRP_MJ_QUERY_SECURITY:
+        return NtfsQuerySecurity(Ctx);
+    case IRP_MJ_SET_SECURITY:
+        return NtfsSetSecurity(Ctx);
+#endif
     }
     return STATUS_INVALID_DEVICE_REQUEST;
 }
@@ -78,22 +101,28 @@ NtfsFsdDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         Ctx.Vcb = (PNTFS_VCB)DeviceObject->DeviceExtension;
     }
 
+#ifdef NTFS_DBGPORT
+    /* trace only: the release build must not touch these parameters (a notify
+       request has no FileName - its CompletionFilter sits there) */
     DBGP("[FSD mj="); DBGX(Ctx.IrpSp->MajorFunction);
     if (Ctx.IrpSp->MajorFunction == IRP_MJ_QUERY_VOLUME_INFORMATION) { DBGP(" vcls="); DBGX(Ctx.IrpSp->Parameters.QueryVolume.FsInformationClass); DBGP(" len="); DBGX(Ctx.IrpSp->Parameters.QueryVolume.Length); }
     if (Ctx.IrpSp->MajorFunction == IRP_MJ_CREATE && Ctx.IrpSp->FileObject) { USHORT k; DBGP(" opt="); DBGX(Ctx.IrpSp->Parameters.Create.Options); DBGP(" \""); for (k = 0; k < Ctx.IrpSp->FileObject->FileName.Length / 2 && k < 80; k++) { char ch[2]; ch[0] = (char)Ctx.IrpSp->FileObject->FileName.Buffer[k]; ch[1] = 0; DBGP(ch); } DBGP("\""); }
-    if (Ctx.IrpSp->MajorFunction == IRP_MJ_DIRECTORY_CONTROL && Ctx.IrpSp->Parameters.QueryDirectory.FileName) { USHORT k; PUNICODE_STRING u = (PUNICODE_STRING)Ctx.IrpSp->Parameters.QueryDirectory.FileName; DBGP(" pat=\""); for (k = 0; k < u->Length / 2 && k < 80; k++) { char ch[2]; ch[0] = (char)u->Buffer[k]; ch[1] = 0; DBGP(ch); } DBGP("\""); }
+    if (Ctx.IrpSp->MajorFunction == IRP_MJ_DIRECTORY_CONTROL && Ctx.IrpSp->MinorFunction == IRP_MN_QUERY_DIRECTORY && Ctx.IrpSp->Parameters.QueryDirectory.FileName) { USHORT k; PUNICODE_STRING u = (PUNICODE_STRING)Ctx.IrpSp->Parameters.QueryDirectory.FileName; DBGP(" pat=\""); for (k = 0; k < u->Length / 2 && k < 80; k++) { char ch[2]; ch[0] = (char)u->Buffer[k]; ch[1] = 0; DBGP(ch); } DBGP("\""); }
     if (Ctx.IrpSp->MajorFunction == IRP_MJ_QUERY_INFORMATION) { DBGP(" icls="); DBGX(Ctx.IrpSp->Parameters.QueryFile.FileInformationClass); DBGP(" len="); DBGX(Ctx.IrpSp->Parameters.QueryFile.Length); }
     if (Ctx.IrpSp->MajorFunction == IRP_MJ_DEVICE_CONTROL || Ctx.IrpSp->MajorFunction == IRP_MJ_FILE_SYSTEM_CONTROL) { DBGP(" ioctl="); DBGX(Ctx.IrpSp->Parameters.DeviceIoControl.IoControlCode); DBGP(" mn="); DBGX(Ctx.IrpSp->MinorFunction); }
     DBGP("]\n");
+#endif
 
     Status = NtfsGuardedDispatch(&Ctx);
 
+#ifdef NTFS_DBGPORT
     if (!NT_SUCCESS(Status)) {
         DBGP("[ERR mj="); DBGX(Ctx.IrpSp->MajorFunction);
         if (Ctx.IrpSp->MajorFunction == IRP_MJ_QUERY_INFORMATION)
             { DBGP(" cls="); DBGX(Ctx.IrpSp->Parameters.QueryFile.FileInformationClass); }
         DBGP(" st="); DBGX(Status); DBGP("]\n");
     }
+#endif
 
     if (!(Ctx.Flags & NTFS_CTX_NO_COMPLETE)) {
         Irp->IoStatus.Status = Status;

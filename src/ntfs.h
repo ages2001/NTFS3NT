@@ -4,9 +4,11 @@
  * headers (shared with the tools), and the in-memory VCB / FCB / CCB.
  *
  *   NTFS_CROSS  GCC/clang cross build vs the mingw-w64 DDK headers (implies the
- *               NT 3.1 import profile NTFS_NT31 and the NT4-era paths), shimming
- *               the SEH keywords GCC-for-NT lacks: __finally still runs and
- *               __leave still unwinds; only catching CPU exceptions is dropped.
+ *               NT 3.1 import profile NTFS_NT31 and the NT4-era paths): the one
+ *               i386 binary for NT 3.1 - 4.0, Windows 2000 and XP.
+ *   NTFS_AMD64  GCC build for Windows XP x64 / Server 2003 x64 (amd64).
+ *   Both shim the SEH keywords GCC-for-NT lacks: __finally still runs and
+ *   __leave still unwinds; only catching CPU exceptions is dropped.
  */
 
 #ifndef _NTFS_H_
@@ -19,6 +21,10 @@
 #ifndef NTFS_NT4
 #define NTFS_NT4
 #endif
+#endif /* NTFS_CROSS */
+
+/* GCC builds (the universal i386 one and the XP x64 one) */
+#if defined(NTFS_CROSS) || defined(NTFS_AMD64)
 #define __try
 #define __finally               __ntfs_leave: __attribute__((unused));
 #define __except(x)             if (0)
@@ -32,7 +38,7 @@
 #ifndef EXCEPTION_EXECUTE_HANDLER
 #define EXCEPTION_EXECUTE_HANDLER 1
 #endif
-#endif /* NTFS_CROSS */
+#endif /* NTFS_CROSS || NTFS_AMD64 */
 
 #include <ntifs.h>
 #include <ntdddisk.h>
@@ -92,7 +98,7 @@ __declspec(dllimport) VOID     NTAPI ObDereferenceObject(PVOID);
 
 #endif /* NTFS_NT31 */
 
-#ifdef NTFS_CROSS
+#if defined(NTFS_CROSS) || defined(NTFS_AMD64)
 typedef IO_STACK_LOCATION EXTENDED_IO_STACK_LOCATION, *PEXTENDED_IO_STACK_LOCATION;
 #endif
 #define NtfsXSp(IrpSp)   ((PEXTENDED_IO_STACK_LOCATION)(IrpSp))
@@ -178,6 +184,23 @@ typedef struct _NTFS_VCB {
     ULONG           MetaDepth;
     PFILE_OBJECT    LockFileObject;       /* volume handle holding the lock */
     UCHAR           NtfsMajor, NtfsMinor; /* $Volume:$VOLUME_INFORMATION version */
+    LIST_ENTRY      NotifyList;           /* held change-notify IRPs (cancel spin lock) */
+
+    /* journal ($LogFile): NULL when the volume is mounted read-only or has no
+     * usable log. The transaction machinery brackets every metadata change. */
+    PVOID           Journal;              /* PNTFS_JOURNAL (ntfsjnl.c) */
+    ULONGLONG       SecureRec;            /* $Secure (record 9) if present, else 0 */
+    ULONGLONG       ObjIdRec;             /* $Extend\$ObjId, 0 if absent */
+    ULONGLONG       QuotaRec;             /* $Extend\$Quota, 0 if absent */
+    ULONGLONG       ReparseRec;           /* $Extend\$Reparse, 0 if absent */
+    ULONGLONG       UsnJrnlRec;           /* $Extend\$UsnJrnl, 0 if absent */
+    ULONGLONG       ExtendRec;            /* \$Extend directory, 0 if absent */
+    ULONG           NextSecurityId;       /* next SecurityId to assign in $Secure */
+    ULONGLONG       NextSdsOffset;        /* append point in $Secure:$SDS */
+    ULONGLONG       UsnNext;              /* next USN (0 = journal inactive) */
+    ULONGLONG       UsnJournalId;
+    ULONGLONG       UsnMaxSize, UsnDelta, UsnLowest;
+    BOOLEAN         QuotaEnabled;
 } NTFS_VCB, *PNTFS_VCB;
 
 static __inline VOID NtfsLockMeta(PNTFS_VCB Vcb)
@@ -256,13 +279,17 @@ typedef struct _NTFS_FCB {
 
     ULONG           RefCount;
     ULONG           UncleanCount;
+
+    FILE_LOCK       FileLock;             /* byte-range locks (LockFile, profile API) */
+    ULONG           FileLockSpare[16];    /* NT 3.1's FILE_LOCK is larger than the headers' */
 } NTFS_FCB, *PNTFS_FCB;
 
 #ifndef FILE_ATTRIBUTE_REPARSE_POINT
 #define FILE_ATTRIBUTE_REPARSE_POINT 0x00000400
 #endif
 /* externally meaningful DOS attributes we surface from $STANDARD_INFORMATION */
-#define NTFS_DOS_ATTR_MASK  0x00000E27  /* RO|HID|SYS|ARC|SPARSE|REPARSE|COMPRESSED */
+#define NTFS_DOS_ATTR_MASK  0x00004E27  /* RO|HID|SYS|ARC|SPARSE|REPARSE|COMPRESSED|ENCRYPTED */
+#define NTFS_FILE_ENCRYPTED 0x00004000  /* FILE_ATTRIBUTE_ENCRYPTED */
 
 /* ------------------------------------------------------------------ */
 /* Context control block - per open handle                             */
@@ -344,6 +371,7 @@ NTSTATUS NTAPI NtfsFsdDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 
 NTSTATUS NtfsCommonFileSystemControl(PNTFS_IRP_CONTEXT Ctx);
 NTSTATUS NtfsMountVolume(PNTFS_IRP_CONTEXT Ctx);
+VOID NtfsDiscoverSpecialFiles(PNTFS_VCB Vcb);
 
 NTSTATUS NtfsCommonCreate(PNTFS_IRP_CONTEXT Ctx);
 NTSTATUS NtfsCommonRead(PNTFS_IRP_CONTEXT Ctx);
@@ -368,6 +396,7 @@ BOOLEAN  NtfsVolumeFsctl(PNTFS_IRP_CONTEXT Ctx, NTSTATUS *Out);
 VOID     NtfsUnlockVolume(PNTFS_VCB Vcb);
 NTSTATUS NtfsDeviceControl(PNTFS_IRP_CONTEXT Ctx);
 NTSTATUS NtfsUpdateFileInfo(PNTFS_VCB Vcb, PNTFS_FCB Fcb);
+NTSTATUS NtfsCreateHardLink(PNTFS_VCB Vcb, PNTFS_FCB Fcb, ULONGLONG tparent, const WCHAR *name, ULONG nl, BOOLEAN replace);
 NTSTATUS NtfsRenameFile(PNTFS_VCB Vcb, PNTFS_FCB Fcb, ULONGLONG tparent,
                         const WCHAR *nn, ULONG nl, BOOLEAN Replace);
 ULONGLONG NtfsLookupInDir(PNTFS_VCB Vcb, ULONGLONG DirRecord, const WCHAR *Name, ULONG NameLen);
@@ -379,9 +408,17 @@ NTSTATUS NtfsDeleteFile(PNTFS_VCB Vcb, PNTFS_FCB Fcb);
 NTSTATUS NtfsTruncateFile(PNTFS_VCB Vcb, PNTFS_FCB Fcb);
 NTSTATUS NtfsCommonClose(PNTFS_IRP_CONTEXT Ctx);
 NTSTATUS NtfsCommonCleanup(PNTFS_IRP_CONTEXT Ctx);
+NTSTATUS NtfsCommonLockControl(PNTFS_IRP_CONTEXT Ctx);
 NTSTATUS NtfsCommonDirectoryControl(PNTFS_IRP_CONTEXT Ctx);
+VOID NtfsNotifyCleanup(PNTFS_VCB Vcb, PFILE_OBJECT FileObject);
 NTSTATUS NtfsCommonQueryInformation(PNTFS_IRP_CONTEXT Ctx);
 NTSTATUS NtfsCommonQueryVolumeInformation(PNTFS_IRP_CONTEXT Ctx);
+NTSTATUS NtfsQuerySecurity(PNTFS_IRP_CONTEXT Ctx);
+NTSTATUS NtfsSetSecurity(PNTFS_IRP_CONTEXT Ctx);
+VOID NtfsReportUsn(PNTFS_VCB Vcb, ULONGLONG RecNo, ULONG Reason);
+NTSTATUS NtfsQueryEa(PNTFS_IRP_CONTEXT Ctx);
+NTSTATUS NtfsSetEa(PNTFS_IRP_CONTEXT Ctx);
+ULONG NtfsEaSize(PNTFS_VCB Vcb, ULONGLONG RecNo);
 
 /* I/O + MFT (ntfsio.c / ntfsmft.c) */
 NTSTATUS NtfsReadDisk(PNTFS_VCB Vcb, ULONGLONG ByteOffset, ULONG Length, PVOID Buffer);
@@ -395,6 +432,33 @@ NTSTATUS NtfsWriteDisk(PNTFS_VCB Vcb, ULONGLONG ByteOffset, ULONG Length, PVOID 
 NTSTATUS NtfsWriteAttributeData(PNTFS_VCB Vcb, PNTFS_RUN Runs, ULONG RunCount,
                                 ULONGLONG Vbo, ULONG Length, PVOID Buffer);
 NTSTATUS NtfsWriteMftRecord(PNTFS_VCB Vcb, ULONGLONG RecordNumber, PVOID Buffer);
+NTSTATUS NtfsWriteResident(PNTFS_VCB Vcb, PNTFS_FCB Fcb, ULONG Offset, ULONG Length, PVOID Buffer);
+NTSTATUS NtfsDecompressFile(PNTFS_VCB Vcb, PNTFS_FCB Fcb);
+NTSTATUS NtfsCompressFile(PNTFS_VCB Vcb, PNTFS_FCB Fcb);
+
+/* journal (ntfsjnl.c): write-ahead logging of metadata changes, Windows-format
+ * $LogFile. Every top-level metadata operation runs inside a transaction. The
+ * write primitives call the Jnl* hooks to log what they change before it goes
+ * to the disk; a hook is a no-op when Vcb->Journal is NULL. */
+VOID     NtfsJnlMount(PNTFS_VCB Vcb, BOOLEAN ReadOnly);   /* read restart, replay if dirty */
+VOID     NtfsJnlUnmount(PNTFS_VCB Vcb, BOOLEAN Clean);
+VOID     NtfsJnlBegin(PNTFS_VCB Vcb);
+NTSTATUS NtfsJnlCommit(PNTFS_VCB Vcb);                    /* end OK: write commit, maybe checkpoint */
+VOID     NtfsJnlAbort(PNTFS_VCB Vcb);                     /* end failed: roll the log back */
+/* log one MFT record about to be written (Old = NULL for a fresh record). Sets
+ * the record's $LogFile LSN. Called by NtfsWriteMftRecord. */
+VOID     NtfsJnlRecord(PNTFS_VCB Vcb, ULONGLONG RecNo, PVOID Old, PVOID New);
+/* NtfsJnlRange Kind values (also the on-disk NJ_REC.Kind) */
+#define NTFS_JNL_MFT      0    /* a whole MFT record (Target = record number)   */
+#define NTFS_JNL_INDEX    1    /* an $INDEX_ALLOCATION block (Target = dir rec)  */
+#define NTFS_JNL_BITMAP   2    /* $Bitmap bytes (Target = 0)                     */
+#define NTFS_JNL_MFTBMP   3    /* $MFT:$BITMAP bytes (Target = 0)                */
+#define NTFS_JNL_DATA     4    /* nonresident unnamed $DATA of record Target     */
+/* log a raw range of a metadata stream (an INDX block, a bitmap range). */
+VOID     NtfsJnlRange(PNTFS_VCB Vcb, ULONG Kind, ULONGLONG Target, ULONGLONG Vbo,
+                      PVOID Old, PVOID New, ULONG Length);
+BOOLEAN  NtfsJnlActive(PNTFS_VCB Vcb);
+BOOLEAN  NtfsJnlInTx(PNTFS_VCB Vcb);
 /* allocation (ntfsalloc.c) */
 NTSTATUS NtfsAllocClusters(PNTFS_VCB Vcb, ULONG Count, ULONGLONG *FirstLcn);
 NTSTATUS NtfsFreeClusters(PNTFS_VCB Vcb, ULONGLONG FirstLcn, ULONG Count);

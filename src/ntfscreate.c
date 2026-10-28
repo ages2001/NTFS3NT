@@ -171,6 +171,54 @@ OpenNamedStream(PNTFS_VCB Vcb, PNTFS_FCB Fcb, PNTFS_CCB Ccb,
     return Status;
 }
 
+/* Tag bit 0x20000000 marks a "name surrogate" (symlink, mount point): the
+ * object manager follows it. Other tags belong to a filter driver. */
+#ifndef IO_REPARSE_TAG_RESERVED_ZERO
+#define IO_REPARSE_TAG_RESERVED_ZERO 0
+#endif
+#define NTFS_REPARSE_NAME_SURROGATE(t)  (((t) & 0x20000000UL) != 0)
+
+/*
+ * A reparse point is being opened for traversal. Read its $REPARSE_POINT data;
+ * for a name-surrogate tag hand it to the I/O manager (STATUS_REPARSE with the
+ * data in the Irp's auxiliary buffer) so the link is resolved. For other tags
+ * open the file normally (STATUS_SUCCESS) so it stays accessible.
+ */
+static NTSTATUS
+NtfsReparseOpen(PNTFS_IRP_CONTEXT Ctx, PNTFS_FCB Fcb)
+{
+    PNTFS_VCB Vcb = Ctx->Vcb;
+    PUCHAR rec;
+    PMFT_RECORD m;
+    PATTRIBUTE_RECORD rp;
+    ULONG tag, vlen;
+    PUCHAR aux;
+
+    if (!NTFS_REPARSE_NAME_SURROGATE(Fcb->ReparseTag) && Fcb->ReparseTag != 0)
+        return STATUS_SUCCESS;        /* a filter's tag: open it normally */
+
+    rec = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, Vcb->Geo.MftRecordSize, NTFS_TAG_BUF);
+    if (!rec) return STATUS_INSUFFICIENT_RESOURCES;
+    if (!NT_SUCCESS(NtfsReadMftRecord(Vcb, Fcb->MftRecord, rec))) { ExFreePool(rec); return STATUS_SUCCESS; }
+    m = (PMFT_RECORD)rec;
+    rp = NtfsFindAttribute(m, ATTR_REPARSE_POINT, NULL, 0);
+    if (!rp || rp->NonResident) { ExFreePool(rec); return STATUS_SUCCESS; }
+    vlen = NtfsResidentValueLength(rp);
+    if (vlen < 8) { ExFreePool(rec); return STATUS_SUCCESS; }
+    tag = *(PULONG)NtfsResidentValue(rp);
+    if (!NTFS_REPARSE_NAME_SURROGATE(tag)) { ExFreePool(rec); return STATUS_SUCCESS; }
+
+    aux = (PUCHAR)ExAllocatePoolWithTag(PagedPool, vlen, NTFS_TAG_BUF);
+    if (!aux) { ExFreePool(rec); return STATUS_INSUFFICIENT_RESOURCES; }
+    RtlCopyMemory(aux, NtfsResidentValue(rp), vlen);
+    ExFreePool(rec);
+
+    /* the I/O manager frees the auxiliary buffer and reparses the path */
+    Ctx->Irp->Tail.Overlay.AuxiliaryBuffer = (PCHAR)aux;
+    Ctx->Irp->IoStatus.Information = tag;
+    return STATUS_REPARSE;
+}
+
 NTSTATUS
 NtfsCommonCreate(PNTFS_IRP_CONTEXT Ctx)
 {
@@ -358,6 +406,21 @@ have_rec:
     }
 
     if (IrpSp->Flags & SL_OPEN_PAGING_FILE) Fcb->FcbState |= FCB_STATE_PAGING_FILE;
+
+    /* reparse point: unless the caller asked to open the link itself
+     * (FILE_OPEN_REPARSE_POINT) or to delete it, hand the reparse data back to
+     * the I/O manager, which resolves the symlink / mount point and re-parses
+     * the path. Non-Microsoft tags go to whatever filter owns them. */
+    if ((Fcb->FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+        !(opts & FILE_OPEN_REPARSE_POINT) && CreateInfo != FILE_CREATED &&
+        !(StreamName && StreamLen)) {
+        NTSTATUS rst = NtfsReparseOpen(Ctx, Fcb);
+        if (rst == STATUS_REPARSE || !NT_SUCCESS(rst)) {
+            Fcb->RefCount--;
+            return rst;
+        }
+        /* rst == STATUS_SUCCESS: a tag we do not surrogate (open it normally) */
+    }
 
     /* directory / non-directory requirements of the open */
     if ((opts & FILE_DIRECTORY_FILE) && !(Fcb->FcbState & FCB_STATE_DIRECTORY)) {

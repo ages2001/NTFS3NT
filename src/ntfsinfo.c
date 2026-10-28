@@ -311,9 +311,20 @@ NtfsCommonQueryVolumeInformation(PNTFS_IRP_CONTEXT Ctx)
         PFILE_FS_ATTRIBUTE_INFORMATION ai = (PFILE_FS_ATTRIBUTE_INFORMATION)Buffer;
         ULONG need = FIELD_OFFSET(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName) + 4 * sizeof(WCHAR);
         if (Length < need) return STATUS_BUFFER_TOO_SMALL;
-        /* case-preserved, Unicode on disk, named streams (ADS); no ACLs and no
-         * compression *writes* are claimed (compressed files are read-only) */
-        ai->FileSystemAttributes = FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK | 0x00040000;
+        /* Advertise what the driver actually supports so capability-gated tools
+         * (fsutil objectid/sparse/reparse, cacls, etc.) accept the volume:
+         *   0x00000001 FILE_CASE_SENSITIVE_SEARCH
+         *   0x00000002 FILE_CASE_PRESERVED_NAMES
+         *   0x00000004 FILE_UNICODE_ON_DISK
+         *   0x00000008 FILE_PERSISTENT_ACLS           (QUERY/SET_SECURITY)
+         *   0x00000040 FILE_SUPPORTS_SPARSE_FILES
+         *   0x00000080 FILE_SUPPORTS_REPARSE_POINTS
+         *   0x00010000 FILE_SUPPORTS_OBJECT_IDS
+         *   0x00040000 FILE_NAMED_STREAMS             (ADS)
+         * Not claimed: per-file compression *writes* (0x10), quotas (0x20),
+         * encryption (0x20000) - those are not implemented as writable here. */
+        ai->FileSystemAttributes = 0x00000001 | 0x00000002 | 0x00000004 | 0x00000008 |
+                                   0x00000040 | 0x00000080 | 0x00010000 | 0x00040000;
         ai->MaximumComponentNameLength = 255;
         ai->FileSystemNameLength = 4 * sizeof(WCHAR);
         ai->FileSystemName[0] = 'N'; ai->FileSystemName[1] = 'T';

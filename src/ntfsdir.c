@@ -344,10 +344,45 @@ NtfsCancelNotify(PDEVICE_OBJECT Dev, PIRP Irp)
 {
     (void)Dev;
     RemoveEntryList(&Irp->Tail.Overlay.ListEntry);
+    InitializeListHead(&Irp->Tail.Overlay.ListEntry);
     IoReleaseCancelSpinLock(Irp->CancelIrql);
     Irp->IoStatus.Status = STATUS_CANCELLED;
     Irp->IoStatus.Information = 0;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
+}
+
+/* Complete the notify requests held for FileObject (NULL: all of them), at
+ * cleanup of the directory handle or when the volume goes away. Without this
+ * the request would hold its file object (and the volume) open until the
+ * thread that issued it exits. */
+VOID
+NtfsNotifyCleanup(PNTFS_VCB Vcb, PFILE_OBJECT FileObject)
+{
+    KIRQL irql;
+    LIST_ENTRY done;
+    PLIST_ENTRY e, n;
+
+    if (Vcb == NULL || Vcb->NotifyList.Flink == NULL) return;
+    InitializeListHead(&done);
+    IoAcquireCancelSpinLock(&irql);
+    for (e = Vcb->NotifyList.Flink; e != &Vcb->NotifyList; e = n) {
+        PIRP Irp = CONTAINING_RECORD(e, IRP, Tail.Overlay.ListEntry);
+        n = e->Flink;
+        if (FileObject == NULL || IoGetCurrentIrpStackLocation(Irp)->FileObject == FileObject) {
+            RemoveEntryList(e);
+            Irp->CancelRoutine = NULL;
+            InsertTailList(&done, e);
+        }
+    }
+    IoReleaseCancelSpinLock(irql);
+    while (!IsListEmpty(&done)) {
+        PIRP Irp;
+        e = RemoveHeadList(&done);
+        Irp = CONTAINING_RECORD(e, IRP, Tail.Overlay.ListEntry);
+        Irp->IoStatus.Status = STATUS_NOTIFY_CLEANUP;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    }
 }
 
 NTSTATUS
@@ -365,13 +400,16 @@ NtfsCommonDirectoryControl(PNTFS_IRP_CONTEXT Ctx)
             Ctx->Irp->IoStatus.Status = STATUS_CANCELLED;
             Ctx->Irp->IoStatus.Information = 0;
             IoCompleteRequest(Ctx->Irp, IO_NO_INCREMENT);
+        } else if (Ctx->Vcb == NULL) {
+            IoReleaseCancelSpinLock(irql);
+            Ctx->Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+            Ctx->Irp->IoStatus.Information = 0;
+            IoCompleteRequest(Ctx->Irp, IO_NO_INCREMENT);
         } else {
-            /* Hold it pending. Self-link the list entry so the cancel routine's
-             * RemoveEntryList is always safe; the I/O manager cancels the held
-             * notify when the directory handle closes. No live notification, but
-             * no spin/freeze (the FATNT fix). */
-            PLIST_ENTRY le = &Ctx->Irp->Tail.Overlay.ListEntry;
-            le->Flink = le->Blink = le;
+            /* Hold it pending on the volume's list until the directory handle
+             * is cleaned up (or the request is cancelled). No live
+             * notification, but no spin/freeze either (the FATNT fix). */
+            InsertTailList(&Ctx->Vcb->NotifyList, &Ctx->Irp->Tail.Overlay.ListEntry);
             Ctx->Irp->CancelRoutine = NtfsCancelNotify;
             IoReleaseCancelSpinLock(irql);
         }

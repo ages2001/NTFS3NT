@@ -37,4 +37,10 @@ NTSTATUS NtfsWriteAttributeData(PNTFS_VCB Vcb, PNTFS_RUN R, ULONG C, ULONGLONG O
 NTSTATUS NtfsAllocClusters(PNTFS_VCB Vcb, ULONG Count, ULONGLONG *First);
 NTSTATUS NtfsFreeClusters(PNTFS_VCB Vcb, ULONGLONG First, ULONG Count);
 NTSTATUS NtfsAllocClustersNear(PNTFS_VCB Vcb, ULONG Count, ULONGLONG Hint, ULONGLONG *First);
+
+/* journal is kernel-only; the user-mode index test never runs in a transaction */
+static __inline BOOLEAN NtfsJnlInTx(PNTFS_VCB Vcb) { (void)Vcb; return FALSE; }
+static __inline void NtfsJnlRange(PNTFS_VCB Vcb, ULONG K, ULONGLONG T, ULONGLONG V,
+                                  PVOID O, PVOID N, ULONG L)
+{ (void)Vcb;(void)K;(void)T;(void)V;(void)O;(void)N;(void)L; }
 #endif

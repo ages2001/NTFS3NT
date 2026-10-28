@@ -63,6 +63,7 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     NtfsInitCaching(DriverObject);
 
     IoRegisterFileSystem(DeviceObject);
+    IoRegisterShutdownNotification(DeviceObject);   /* clean-unmount the journals at shutdown */
     DBGP("[NTFS3NT: loaded]\n");
     return STATUS_SUCCESS;
 }

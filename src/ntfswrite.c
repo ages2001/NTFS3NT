@@ -223,7 +223,7 @@ NtfsSetResidentSize(PNTFS_VCB Vcb, PNTFS_FCB Fcb, PUCHAR rec, ULONG NewLen)
 
 /* Write a resident file's $DATA in place, growing the value inside the MFT
  * record when it still fits. STATUS_BUFFER_OVERFLOW = must go non-resident. */
-static NTSTATUS
+NTSTATUS
 NtfsWriteResident(PNTFS_VCB Vcb, PNTFS_FCB Fcb, ULONG Offset, ULONG Length, PVOID Buffer)
 {
     PUCHAR rec;
@@ -268,7 +268,10 @@ NtfsTruncateFile(PNTFS_VCB Vcb, PNTFS_FCB Fcb)
     NTSTATUS Status;
 
     if (Fcb->FcbState & FCB_STATE_DIRECTORY) return STATUS_FILE_IS_A_DIRECTORY;
-    if (Fcb->DataCompressed) return STATUS_ACCESS_DENIED;
+    if (Fcb->DataCompressed) {
+        Status = NtfsDecompressFile(Vcb, Fcb);     /* truncate makes it plain */
+        if (!NT_SUCCESS(Status)) return Status;
+    }
     Fcb->FcbState |= FCB_STATE_MODIFIED;
     rec = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, Vcb->Geo.MftRecordSize, NTFS_TAG_BUF);
     if (rec == NULL) return STATUS_INSUFFICIENT_RESOURCES;
@@ -406,6 +409,291 @@ RemoveAttr(PMFT_RECORD m, PATTRIBUTE_RECORD a)
     ULONG len = a->Length, end = (ULONG)(at - p) + len;
     memmove(at, at + len, m->BytesInUse - end);
     m->BytesInUse -= len;
+}
+
+/* ================================================================== */
+/* Transparent LZNT1 compression: whole-file compress / decompress.     */
+/* These rewrite a file's $DATA layout atomically under a journal        */
+/* transaction. Bounded by NTFS_COMPRESS_MAX so the whole-file buffer     */
+/* stays within non-paged pool (the uncommon write-to-compressed path).   */
+/* ================================================================== */
+
+#define NTFS_COMPRESS_MAX   (8u * 1024u * 1024u)   /* 8 MB whole-file RMW cap */
+#define NTFS_CU_CLUSTERS    16u                    /* standard compression unit */
+#define NTFS_CU_SHIFT       4u                     /* log2(16) -> CompressionUnit field */
+
+/* Allocate `clusters` clusters into the run array (up to cap runs); returns the
+ * run count, or 0 on failure (and frees whatever it got). Non-sparse runs only. */
+static ULONG
+AllocPlainRuns(PNTFS_VCB Vcb, ULONGLONG clusters, PNTFS_RUN runs, ULONG cap, ULONGLONG startVcn)
+{
+    ULONG rc = 0; ULONGLONG left = clusters, vcn = startVcn, hint = 0;
+    while (left) {
+        ULONG got; ULONGLONG lcn;
+        ULONG want = (left > 0xFFFFFFFFUL) ? 0xFFFFFFF0UL : (ULONG)left;
+        if (rc >= cap) goto fail;
+        if (!NT_SUCCESS(NtfsAllocClustersPartial(Vcb, want, hint, &lcn, &got)) || got == 0) goto fail;
+        if (rc > 0 && !runs[rc-1].Sparse && runs[rc-1].Lcn + runs[rc-1].Length == lcn) {
+            runs[rc-1].Length += got;
+        } else {
+            runs[rc].Vcn = vcn; runs[rc].Lcn = lcn; runs[rc].Length = got; runs[rc].Sparse = FALSE; rc++;
+        }
+        vcn += got; left -= got; hint = lcn + got;
+    }
+    return rc;
+fail:
+    { ULONG i; for (i = 0; i < rc; i++) if (!runs[i].Sparse) NtfsFreeClusters(Vcb, runs[i].Lcn, (ULONG)runs[i].Length); }
+    return 0;
+}
+
+/* Set/clear the FILE_ATTRIBUTE_COMPRESSED (0x800) display bit in $STD_INFO and
+ * every $FILE_NAME of the record `m` already in memory (caller writes it). */
+static VOID
+SetCompressDisplayBit(PMFT_RECORD m, BOOLEAN On)
+{
+    PATTRIBUTE_RECORD a = NtfsFindAttribute(m, ATTR_STANDARD_INFORMATION, NULL, 0);
+    if (a && !a->NonResident) {
+        PSTANDARD_INFORMATION si = (PSTANDARD_INFORMATION)NtfsResidentValue(a);
+        if (On) si->FileAttributes |= 0x800u; else si->FileAttributes &= ~0x800u;
+    }
+    for (a = NextAttrOfType(m, NULL, ATTR_FILE_NAME); a; a = NextAttrOfType(m, a, ATTR_FILE_NAME)) {
+        PFILE_NAME_ATTR fn;
+        if (a->NonResident) continue;
+        fn = (PFILE_NAME_ATTR)NtfsResidentValue(a);
+        if (On) fn->FileAttributes |= 0x800u; else fn->FileAttributes &= ~0x800u;
+    }
+}
+
+/* Decompress a compressed file into a plain non-resident $DATA. Safe: produces
+ * an ordinary file using the proven plain-run layout. Caller holds no locks. */
+NTSTATUS
+NtfsDecompressFile(PNTFS_VCB Vcb, PNTFS_FCB Fcb)
+{
+    ULONG Cs = Vcb->Geo.ClusterSize;
+    ULONGLONG dataSize, allocBytes;
+    ULONG needClu, cap, rc = 0, i, oldRc = 0;
+    PUCHAR buf = NULL, rec = NULL;
+    PNTFS_RUN runs = NULL, oldRuns = NULL;
+    PMFT_RECORD m;
+    NTSTATUS Status;
+    BOOLEAN locked = FALSE, extents = FALSE;
+
+    if (!Fcb->DataCompressed || Fcb->DataResident) return STATUS_SUCCESS;
+    dataSize = (ULONGLONG)Fcb->Header.FileSize.QuadPart;
+    if (dataSize > NTFS_COMPRESS_MAX) return STATUS_NOT_SUPPORTED;   /* too big to RMW here */
+    needClu = (ULONG)((dataSize + Cs - 1) / Cs);
+    allocBytes = (ULONGLONG)needClu * Cs;
+
+    buf = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, (ULONG)(allocBytes ? allocBytes : Cs), NTFS_TAG_BUF);
+    rec = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, Vcb->Geo.MftRecordSize, NTFS_TAG_BUF);
+    cap = Fcb->DataRunCount + needClu + 16;
+    runs = (PNTFS_RUN)ExAllocatePoolWithTag(NonPagedPool, cap * sizeof(NTFS_RUN), NTFS_TAG_RUN);
+    if (!buf || !rec || !runs) { Status = STATUS_INSUFFICIENT_RESOURCES; goto out; }
+
+    if (needClu) RtlZeroMemory(buf, (ULONG)allocBytes);
+    if (dataSize) {
+        Status = NtfsReadCompressed(Vcb, Fcb->DataRuns, Fcb->DataRunCount, Fcb->CuClusters,
+                                    0, (ULONG)dataSize, buf);
+        if (!NT_SUCCESS(Status)) goto out;
+    }
+
+    NtfsJnlBegin(Vcb);
+    NTFS_LOCK_META(Vcb);
+    locked = TRUE;
+
+    /* snapshot the old (compressed) runs so we can free their clusters */
+    oldRc = Fcb->DataRunCount;
+    oldRuns = (PNTFS_RUN)ExAllocatePoolWithTag(NonPagedPool, (oldRc ? oldRc : 1) * sizeof(NTFS_RUN), NTFS_TAG_RUN);
+    if (!oldRuns) { Status = STATUS_INSUFFICIENT_RESOURCES; goto unlock; }
+    RtlCopyMemory(oldRuns, Fcb->DataRuns, oldRc * sizeof(NTFS_RUN));
+
+    if (needClu) {
+        rc = AllocPlainRuns(Vcb, needClu, runs, cap, 0);
+        if (rc == 0) { Status = STATUS_DISK_FULL; goto unlock; }
+        Status = NtfsWriteAttributeData(Vcb, runs, rc, 0, (ULONG)allocBytes, buf);
+        if (!NT_SUCCESS(Status)) goto freenew;
+    }
+
+    Status = NtfsReadMftRecord(Vcb, Fcb->MftRecord, rec);
+    if (!NT_SUCCESS(Status)) goto freenew;
+    m = (PMFT_RECORD)rec;
+
+    if (needClu == 0) {
+        /* empty file: a zero-length plain non-resident $DATA (single sparse-free run not
+         * possible) - fall back to a tiny resident $DATA is overkill; keep one real cluster */
+        rc = AllocPlainRuns(Vcb, 1, runs, cap, 0);
+        if (rc == 0) { Status = STATUS_DISK_FULL; goto freenew; }
+        allocBytes = Cs;
+    }
+
+    if (NtfsFindAttribute(m, ATTR_ATTRIBUTE_LIST, NULL, 0) == NULL &&
+        NtfsSetBaseDataRuns(m, Vcb->Geo.MftRecordSize, runs, rc, allocBytes, dataSize, 0, 0)) {
+        SetCompressDisplayBit(m, FALSE);
+        Status = NtfsWriteMftRecord(Vcb, Fcb->MftRecord, rec);
+        if (!NT_SUCCESS(Status)) goto freenew;
+    } else {
+        /* run list too big for the base record: use the extent writer (plain) */
+        Status = NtfsWriteDataExtents(Vcb, Fcb, runs, rc, allocBytes, dataSize, dataSize);
+        if (!NT_SUCCESS(Status)) goto freenew;
+        extents = TRUE;
+        /* clear the display bit in the (possibly rewritten) base record */
+        if (NT_SUCCESS(NtfsReadMftRecord(Vcb, Fcb->MftRecord, rec))) {
+            SetCompressDisplayBit((PMFT_RECORD)rec, FALSE);
+            NtfsWriteMftRecord(Vcb, Fcb->MftRecord, rec);
+        }
+    }
+
+    /* success: free the old compressed clusters and adopt the new layout */
+    for (i = 0; i < oldRc; i++)
+        if (!oldRuns[i].Sparse && oldRuns[i].Length)
+            NtfsFreeClusters(Vcb, oldRuns[i].Lcn, (ULONG)oldRuns[i].Length);
+    if (!extents) {
+        PNTFS_RUN nr = (PNTFS_RUN)ExAllocatePoolWithTag(NonPagedPool, rc * sizeof(NTFS_RUN), NTFS_TAG_RUN);
+        if (nr) { RtlCopyMemory(nr, runs, rc * sizeof(NTFS_RUN));
+                  if (Fcb->DataRuns) ExFreePool(Fcb->DataRuns); Fcb->DataRuns = nr; Fcb->DataRunCount = rc; }
+    }
+    Fcb->DataCompressed = FALSE;
+    Fcb->CuClusters = 0;
+    Fcb->FileAttributes &= ~0x800u;
+    Fcb->Header.AllocationSize.QuadPart = (LONGLONG)allocBytes;
+    Status = STATUS_SUCCESS;
+    goto unlock;
+
+freenew:
+    for (i = 0; i < rc; i++) if (!runs[i].Sparse && runs[i].Length) NtfsFreeClusters(Vcb, runs[i].Lcn, (ULONG)runs[i].Length);
+unlock:
+    if (locked) NTFS_UNLOCK_META(Vcb);
+    if (NT_SUCCESS(Status)) NtfsJnlCommit(Vcb); else NtfsJnlAbort(Vcb);
+out:
+    if (buf) ExFreePool(buf);
+    if (rec) ExFreePool(rec);
+    if (runs) ExFreePool(runs);
+    if (oldRuns) ExFreePool(oldRuns);
+    return Status;
+}
+
+/* Compress a plain non-resident file into an LZNT1-compressed $DATA. Builds the
+ * compressed layout (per unit: compressed clusters + a sparse hole, or 16 real
+ * clusters when a unit does not shrink) and rewrites the base-record $DATA with
+ * CompressionUnit=4. If the file cannot be represented in the base record, or is
+ * resident/empty/too large, it is left plain (success - NTFS also stores some
+ * files uncompressed). Caller holds no locks. */
+NTSTATUS
+NtfsCompressFile(PNTFS_VCB Vcb, PNTFS_FCB Fcb)
+{
+    ULONG Cs = Vcb->Geo.ClusterSize;
+    ULONG CuClu = NTFS_CU_CLUSTERS, unitBytes = NTFS_CU_CLUSTERS * Cs;
+    ULONGLONG dataSize, u, numUnits, totalReal = 0;
+    ULONG needClu, cap, rc = 0, i, oldRc = 0;
+    PUCHAR buf = NULL, comp = NULL, body = NULL, rec = NULL;
+    PNTFS_RUN runs = NULL, oldRuns = NULL;
+    PMFT_RECORD m;
+    NTSTATUS Status;
+    BOOLEAN locked = FALSE;
+
+    if (Fcb->DataCompressed || Fcb->DataResident) return STATUS_SUCCESS;
+    if (Fcb->FcbState & FCB_STATE_DIRECTORY) return STATUS_SUCCESS;
+    dataSize = (ULONGLONG)Fcb->Header.FileSize.QuadPart;
+    if (dataSize == 0 || dataSize > NTFS_COMPRESS_MAX) return STATUS_SUCCESS;  /* leave plain */
+    needClu = (ULONG)((dataSize + Cs - 1) / Cs);
+    numUnits = (dataSize + unitBytes - 1) / unitBytes;
+
+    buf  = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, (ULONG)(numUnits * unitBytes), NTFS_TAG_BUF);
+    comp = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, unitBytes + 4096, NTFS_TAG_BUF);
+    body = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, 4096, NTFS_TAG_BUF);
+    rec  = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, Vcb->Geo.MftRecordSize, NTFS_TAG_BUF);
+    cap  = (ULONG)(numUnits * 2 + 8);
+    runs = (PNTFS_RUN)ExAllocatePoolWithTag(NonPagedPool, cap * sizeof(NTFS_RUN), NTFS_TAG_RUN);
+    if (!buf || !comp || !body || !rec || !runs) { Status = STATUS_INSUFFICIENT_RESOURCES; goto out; }
+
+    RtlZeroMemory(buf, (ULONG)(numUnits * unitBytes));
+    Status = NtfsReadAttributeData(Vcb, Fcb->DataRuns, Fcb->DataRunCount, 0, (ULONG)((dataSize + Cs - 1) & ~((ULONGLONG)Cs - 1)), buf);
+    if (!NT_SUCCESS(Status)) goto out;
+
+    NtfsJnlBegin(Vcb);
+    NTFS_LOCK_META(Vcb);
+    locked = TRUE;
+
+    oldRc = Fcb->DataRunCount;
+    oldRuns = (PNTFS_RUN)ExAllocatePoolWithTag(NonPagedPool, (oldRc ? oldRc : 1) * sizeof(NTFS_RUN), NTFS_TAG_RUN);
+    if (!oldRuns) { Status = STATUS_INSUFFICIENT_RESOURCES; goto unlock; }
+    RtlCopyMemory(oldRuns, Fcb->DataRuns, oldRc * sizeof(NTFS_RUN));
+
+    /* lay out each compression unit */
+    for (u = 0; u < numUnits; u++) {
+        PUCHAR unitPtr = buf + (ULONG)(u * unitBytes);
+        ULONG op = NtfsLznt1CompressUnit(unitPtr, unitBytes, comp, unitBytes, body);
+        ULONG compClu = (op == 0xFFFFFFFFUL) ? CuClu : ((op + Cs - 1) / Cs);
+        ULONGLONG vcn = u * CuClu;
+        if (compClu < CuClu) {
+            /* compressed: compClu real clusters hold the LZNT1 stream, rest sparse */
+            ULONG got = AllocPlainRuns(Vcb, compClu, runs + rc, cap - rc, vcn);
+            if (got == 0) { Status = STATUS_DISK_FULL; goto freenew; }
+            rc += got;
+            RtlZeroMemory(comp + op, compClu * Cs - op);
+            Status = NtfsWriteAttributeData(Vcb, runs, rc, vcn * Cs, compClu * Cs, comp);
+            if (!NT_SUCCESS(Status)) goto freenew;
+            /* sparse hole to pad the unit to CuClu VCNs */
+            if (rc >= cap) { Status = STATUS_INSUFFICIENT_RESOURCES; goto freenew; }
+            runs[rc].Vcn = vcn + compClu; runs[rc].Lcn = 0;
+            runs[rc].Length = CuClu - compClu; runs[rc].Sparse = TRUE; rc++;
+            totalReal += compClu;
+        } else {
+            /* no gain: 16 real clusters holding the raw unit bytes */
+            ULONG got = AllocPlainRuns(Vcb, CuClu, runs + rc, cap - rc, vcn);
+            if (got == 0) { Status = STATUS_DISK_FULL; goto freenew; }
+            rc += got;
+            Status = NtfsWriteAttributeData(Vcb, runs, rc, vcn * Cs, unitBytes, unitPtr);
+            if (!NT_SUCCESS(Status)) goto freenew;
+            totalReal += CuClu;
+        }
+    }
+
+    /* no space saved at all: keep the file plain (free the new clusters) */
+    if (totalReal >= (ULONGLONG)numUnits * CuClu) { Status = STATUS_SUCCESS; goto freenew; }
+
+    Status = NtfsReadMftRecord(Vcb, Fcb->MftRecord, rec);
+    if (!NT_SUCCESS(Status)) goto freenew;
+    m = (PMFT_RECORD)rec;
+    if (NtfsFindAttribute(m, ATTR_ATTRIBUTE_LIST, NULL, 0) != NULL ||
+        !NtfsSetBaseDataRuns(m, Vcb->Geo.MftRecordSize, runs, rc,
+                             (numUnits * CuClu) * Cs, dataSize, NTFS_CU_SHIFT, totalReal * Cs)) {
+        /* mapping won't fit the base record: leave the file plain */
+        Status = STATUS_SUCCESS; goto freenew;
+    }
+    SetCompressDisplayBit(m, TRUE);
+    Status = NtfsWriteMftRecord(Vcb, Fcb->MftRecord, rec);
+    if (!NT_SUCCESS(Status)) goto freenew;
+
+    /* success: free old plain clusters, adopt compressed layout */
+    for (i = 0; i < oldRc; i++)
+        if (!oldRuns[i].Sparse && oldRuns[i].Length)
+            NtfsFreeClusters(Vcb, oldRuns[i].Lcn, (ULONG)oldRuns[i].Length);
+    {
+        PNTFS_RUN nr = (PNTFS_RUN)ExAllocatePoolWithTag(NonPagedPool, rc * sizeof(NTFS_RUN), NTFS_TAG_RUN);
+        if (nr) { RtlCopyMemory(nr, runs, rc * sizeof(NTFS_RUN));
+                  if (Fcb->DataRuns) ExFreePool(Fcb->DataRuns); Fcb->DataRuns = nr; Fcb->DataRunCount = rc; }
+    }
+    Fcb->DataCompressed = TRUE;
+    Fcb->CuClusters = CuClu;
+    Fcb->FileAttributes |= 0x800u;
+    Fcb->Header.AllocationSize.QuadPart = (LONGLONG)((numUnits * CuClu) * Cs);
+    Status = STATUS_SUCCESS;
+    goto unlock;
+
+freenew:
+    for (i = 0; i < rc; i++) if (!runs[i].Sparse && runs[i].Length) NtfsFreeClusters(Vcb, runs[i].Lcn, (ULONG)runs[i].Length);
+unlock:
+    if (locked) NTFS_UNLOCK_META(Vcb);
+    if (NT_SUCCESS(Status)) NtfsJnlCommit(Vcb); else NtfsJnlAbort(Vcb);
+out:
+    if (buf) ExFreePool(buf);
+    if (comp) ExFreePool(comp);
+    if (body) ExFreePool(body);
+    if (rec) ExFreePool(rec);
+    if (runs) ExFreePool(runs);
+    if (oldRuns) ExFreePool(oldRuns);
+    return Status;
 }
 
 /* ---- DOS 8.3 short names ------------------------------------------------- */
@@ -555,6 +843,7 @@ NtfsCreateInDir(PNTFS_VCB Vcb, ULONGLONG parentRec, USHORT parentSeq,
     entbuf = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, 600, NTFS_TAG_BUF);
     if (!frec || !entbuf) { Status = STATUS_INSUFFICIENT_RESOURCES; goto done; }
 
+    NtfsJnlBegin(Vcb);
     NTFS_LOCK_META(Vcb);
     Status = NtfsAllocMftRecord(Vcb, &newRec);
     if (!NT_SUCCESS(Status)) goto unlock;
@@ -614,6 +903,7 @@ NtfsCreateInDir(PNTFS_VCB Vcb, ULONGLONG parentRec, USHORT parentSeq,
     Status = STATUS_SUCCESS;
 unlock:
     NTFS_UNLOCK_META(Vcb);
+    if (NT_SUCCESS(Status)) NtfsJnlCommit(Vcb); else NtfsJnlAbort(Vcb);
 done:
     if (frec) ExFreePool(frec);
     if (entbuf) ExFreePool(entbuf);
@@ -700,6 +990,7 @@ NtfsDeleteFile(PNTFS_VCB Vcb, PNTFS_FCB Fcb)
     xrec = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, Vcb->Geo.MftRecordSize, NTFS_TAG_BUF);
     if (!frec || !xrec) { Status = STATUS_INSUFFICIENT_RESOURCES; goto done; }
 
+    NtfsJnlBegin(Vcb);
     NTFS_LOCK_META(Vcb);
     Status = NtfsReadMftRecord(Vcb, Fcb->MftRecord, frec);
     if (!NT_SUCCESS(Status)) goto unlock;
@@ -750,6 +1041,7 @@ NtfsDeleteFile(PNTFS_VCB Vcb, PNTFS_FCB Fcb)
     Status = NtfsFreeMftRecord(Vcb, Fcb->MftRecord);
 unlock:
     NTFS_UNLOCK_META(Vcb);
+    if (NT_SUCCESS(Status)) NtfsJnlCommit(Vcb); else NtfsJnlAbort(Vcb);
 done:
     if (frec) ExFreePool(frec);
     if (xrec) ExFreePool(xrec);
@@ -773,6 +1065,7 @@ NtfsUpdateFileInfo(PNTFS_VCB Vcb, PNTFS_FCB Fcb)
 
     frec = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, Vcb->Geo.MftRecordSize, NTFS_TAG_BUF);
     if (frec == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+    NtfsJnlBegin(Vcb);
     NTFS_LOCK_META(Vcb);
     Status = NtfsReadMftRecord(Vcb, Fcb->MftRecord, frec);
     if (!NT_SUCCESS(Status)) goto out;
@@ -812,6 +1105,7 @@ NtfsUpdateFileInfo(PNTFS_VCB Vcb, PNTFS_FCB Fcb)
         if (!a->NonResident) NtfsIndexUpdate(Vcb, (PFILE_NAME_ATTR)NtfsResidentValue(a));
 out:
     NTFS_UNLOCK_META(Vcb);
+    if (NT_SUCCESS(Status)) NtfsJnlCommit(Vcb); else NtfsJnlAbort(Vcb);
     ExFreePool(frec);
     return Status;
 }
@@ -821,6 +1115,121 @@ out:
  * the current parent). An existing different target is replaced only when
  * Replace is set and it is a closed, non-directory file.
  */
+/*
+ * Create a hard link: add a new $FILE_NAME (Win32, + a DOS alias if the name is
+ * not 8.3) for `name` in directory `tparent` on the file's existing MFT record,
+ * bump its link count, and insert the directory index entry. The file keeps one
+ * record; only names multiply. Directories cannot be hard-linked.
+ */
+NTSTATUS
+NtfsCreateHardLink(PNTFS_VCB Vcb, PNTFS_FCB Fcb, ULONGLONG tparent,
+                   const WCHAR *name, ULONG nl, BOOLEAN replace)
+{
+    PUCHAR rec = NULL, old = NULL, entbuf = NULL, ab = NULL;
+    PMFT_RECORD m;
+    PATTRIBUTE_RECORD fna;
+    PFILE_NAME_ATTR src, nfn;
+    ULONGLONG parentRef, fileRef;
+    USHORT pseq = 5;
+    ULONG vlen, alen, i, entLen, before;
+    NTSTATUS Status;
+
+    if (nl == 0 || nl > 255) return STATUS_OBJECT_NAME_INVALID;
+    for (i = 0; i < nl; i++)
+        if (name[i] < 0x20 || name[i] == '"' || name[i] == '*' || name[i] == '/' ||
+            name[i] == ':' || name[i] == '<' || name[i] == '>' || name[i] == '?' ||
+            name[i] == '|' || name[i] == '\\')
+            return STATUS_OBJECT_NAME_INVALID;
+    if (Fcb->FcbState & FCB_STATE_DIRECTORY) return STATUS_FILE_IS_A_DIRECTORY;
+
+    rec = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, Vcb->Geo.MftRecordSize, NTFS_TAG_BUF);
+    old = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, Vcb->Geo.MftRecordSize, NTFS_TAG_BUF);
+    entbuf = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, 600, NTFS_TAG_BUF);
+    ab = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, 0x18 + sizeof(FILE_NAME_ATTR) + 512, NTFS_TAG_BUF);
+    if (!rec || !old || !entbuf || !ab) { Status = STATUS_INSUFFICIENT_RESOURCES; goto out; }
+
+    NtfsJnlBegin(Vcb);
+    NTFS_LOCK_META(Vcb);
+
+    if (NtfsLookupInDir(Vcb, tparent, name, nl) != (ULONGLONG)-1) {
+        Status = replace ? STATUS_NOT_IMPLEMENTED : STATUS_OBJECT_NAME_COLLISION;
+        goto unlock;
+    }
+    Status = NtfsReadMftRecord(Vcb, Fcb->MftRecord, rec);
+    if (!NT_SUCCESS(Status)) goto unlock;
+    m = (PMFT_RECORD)rec;
+    if (m->Flags & MFT_RECORD_IS_DIRECTORY) { Status = STATUS_FILE_IS_A_DIRECTORY; goto unlock; }
+    RtlCopyMemory(old, rec, Vcb->Geo.MftRecordSize);
+
+    fna = NtfsFindAttribute(m, ATTR_FILE_NAME, NULL, 0);
+    if (!fna) { Status = STATUS_UNSUCCESSFUL; goto unlock; }
+    src = (PFILE_NAME_ATTR)NtfsResidentValue(fna);
+
+    /* parent sequence for the file reference in the key */
+    { PUCHAR pr = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, Vcb->Geo.MftRecordSize, NTFS_TAG_BUF);
+      if (pr && NT_SUCCESS(NtfsReadMftRecord(Vcb, tparent, pr))) pseq = ((PMFT_RECORD)pr)->SequenceNumber;
+      if (pr) ExFreePool(pr); }
+    parentRef = (tparent & 0xFFFFFFFFFFFFULL) | ((ULONGLONG)pseq << 48);
+    fileRef = (Fcb->MftRecord & 0xFFFFFFFFFFFFULL) | ((ULONGLONG)m->SequenceNumber << 48);
+
+    /* build the new Win32 $FILE_NAME from the file's existing one (same times
+     * and sizes), with the new parent and name */
+    vlen = sizeof(FILE_NAME_ATTR) + nl * 2;
+    alen = (0x18 + vlen + 7) & ~7u;
+    RtlZeroMemory(ab, alen);
+    { PATTRIBUTE_RECORD a = (PATTRIBUTE_RECORD)ab;
+      a->Type = ATTR_FILE_NAME; a->Length = alen; a->NameOffset = 0x18;
+      a->Form.Resident.ValueLength = vlen; a->Form.Resident.ValueOffset = 0x18;
+      a->Form.Resident.IndexedFlag = 1; }
+    nfn = (PFILE_NAME_ATTR)(ab + 0x18);
+    RtlCopyMemory(nfn, src, sizeof(FILE_NAME_ATTR));
+    nfn->ParentDirectory = parentRef;
+    nfn->NameLength = (UCHAR)nl;
+    nfn->NameType = NTFS_FNAME_WIN32;
+    for (i = 0; i < nl; i++) ((PWCHAR)(ab + 0x18 + sizeof(FILE_NAME_ATTR)))[i] = name[i];
+
+    before = 0;
+    { PATTRIBUTE_RECORD a; for (a = NextAttrOfType(m, NULL, ATTR_FILE_NAME); a; a = NextAttrOfType(m, a, ATTR_FILE_NAME)) before++; }
+    if (!NtfsInsertAttributeEx(m, Vcb->Geo.MftRecordSize, ab, alen, FALSE)) {
+        Status = STATUS_INSUFFICIENT_RESOURCES; goto unlock;
+    }
+    m->HardLinkCount = (USHORT)(before + 1);
+    /* a DOS alias if the name is not a legal 8.3 (adds a second name) */
+    NtfsAddDosName(Vcb, m, tparent);
+    { USHORT cnt = 0; PATTRIBUTE_RECORD a;
+      for (a = NextAttrOfType(m, NULL, ATTR_FILE_NAME); a; a = NextAttrOfType(m, a, ATTR_FILE_NAME)) cnt++;
+      m->HardLinkCount = cnt; }
+
+    NtfsJnlRecord(Vcb, Fcb->MftRecord, old, rec);
+    Status = NtfsWriteMftRecord(Vcb, Fcb->MftRecord, rec);
+    if (!NT_SUCCESS(Status)) goto unlock;
+
+    /* insert index entries for every name that now points to tparent and is
+     * not already linked there (the new Win32 name and its DOS alias) */
+    { PATTRIBUTE_RECORD a;
+      for (a = NextAttrOfType(m, NULL, ATTR_FILE_NAME); a; a = NextAttrOfType(m, a, ATTR_FILE_NAME)) {
+        PFILE_NAME_ATTR f = (PFILE_NAME_ATTR)NtfsResidentValue(a);
+        if ((f->ParentDirectory & 0xFFFFFFFFFFFFULL) != tparent) continue;
+        if (NtfsLookupInDir(Vcb, tparent, (PWCHAR)((PUCHAR)f + sizeof(FILE_NAME_ATTR)), f->NameLength) != (ULONGLONG)-1)
+            continue;
+        entLen = NtfsMakeIndexEntry(entbuf, fileRef, f);
+        NtfsIndexAdd(Vcb, tparent, entbuf, entLen,
+                     (PWCHAR)((PUCHAR)f + sizeof(FILE_NAME_ATTR)), f->NameLength);
+      }
+    }
+    Status = STATUS_SUCCESS;
+
+unlock:
+    NTFS_UNLOCK_META(Vcb);
+    if (NT_SUCCESS(Status)) NtfsJnlCommit(Vcb); else NtfsJnlAbort(Vcb);
+out:
+    if (rec) ExFreePool(rec);
+    if (old) ExFreePool(old);
+    if (entbuf) ExFreePool(entbuf);
+    if (ab) ExFreePool(ab);
+    return Status;
+}
+
 NTSTATUS
 NtfsRenameFile(PNTFS_VCB Vcb, PNTFS_FCB Fcb, ULONGLONG tparent,
                const WCHAR *nn, ULONG nl, BOOLEAN Replace)
@@ -846,6 +1255,7 @@ NtfsRenameFile(PNTFS_VCB Vcb, PNTFS_FCB Fcb, ULONGLONG tparent,
     entbuf = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, 600, NTFS_TAG_BUF);
     if (!frec || !prec || !entbuf) { Status = STATUS_INSUFFICIENT_RESOURCES; goto done; }
 
+    NtfsJnlBegin(Vcb);
     NTFS_LOCK_META(Vcb);
     Status = NtfsReadMftRecord(Vcb, Fcb->MftRecord, frec);
     if (!NT_SUCCESS(Status)) goto unlock;
@@ -958,6 +1368,7 @@ NtfsRenameFile(PNTFS_VCB Vcb, PNTFS_FCB Fcb, ULONGLONG tparent,
     }
 unlock:
     NTFS_UNLOCK_META(Vcb);
+    if (NT_SUCCESS(Status)) NtfsJnlCommit(Vcb); else NtfsJnlAbort(Vcb);
 done:
     if (frec) ExFreePool(frec);
     if (prec) ExFreePool(prec);
@@ -1099,9 +1510,23 @@ NtfsCommonWrite(PNTFS_IRP_CONTEXT Ctx)
     if (!NtfsData.WriteEnabled) return STATUS_MEDIA_WRITE_PROTECTED;
     if (Fcb->FcbState & FCB_STATE_DIRECTORY) return STATUS_INVALID_DEVICE_REQUEST;
     if (Length == 0) return STATUS_SUCCESS;
-    /* LZNT1-compressed data is read-only: writing raw bytes into compression
-     * units would corrupt the file */
-    if (Fcb->DataCompressed) return STATUS_ACCESS_DENIED;
+    /* Writing into a compressed file: transparently decompress it to a plain
+     * file first (it becomes uncompressed), then write normally. Paging writes
+     * happen under Mm locks where the whole-file RMW is unsafe, so those still
+     * refuse - a compressed file is never the paging file and mmap writes to
+     * one are vanishingly rare. */
+    if (Fcb->DataCompressed) {
+        if (Ctx->Irp->Flags & IRP_PAGING_IO) return STATUS_ACCESS_DENIED;
+        Status = NtfsDecompressFile(Vcb, Fcb);
+        if (!NT_SUCCESS(Status)) return Status;
+    }
+    /* EFS-encrypted file: this driver has no EFS key handling, so writing raw
+     * bytes would replace ciphertext with plaintext and corrupt the file. We
+     * preserve encrypted files read-only (reads return the stored ciphertext). */
+    if (Fcb->FileAttributes & NTFS_FILE_ENCRYPTED) return STATUS_ACCESS_DENIED;
+    /* a byte range another handle has locked */
+    if (!(Ctx->Irp->Flags & IRP_PAGING_IO) && !FsRtlCheckLockForWriteAccess(&Fcb->FileLock, Ctx->Irp))
+        return STATUS_FILE_LOCK_CONFLICT;
 
     /*
      * Paging I/O (the paging file, and memory-mapped flushes) must write straight
@@ -1113,6 +1538,9 @@ NtfsCommonWrite(PNTFS_IRP_CONTEXT Ctx)
     if (Ctx->Irp->Flags & IRP_PAGING_IO) {
         ULONGLONG alloc = (ULONGLONG)Fcb->Header.AllocationSize.QuadPart;
         ULONG wlen = Length;
+        /* a deleted (or replaced) file: its clusters may belong to another file
+         * by now, so its late dirty pages go nowhere */
+        if (Fcb->MftRecord == NTFS_DEAD_RECORD) { Ctx->Irp->IoStatus.Information = Length; return STATUS_SUCCESS; }
         if (Offset >= alloc) { Ctx->Irp->IoStatus.Information = 0; return STATUS_SUCCESS; }
         if (Offset + wlen > alloc) wlen = (ULONG)(alloc - Offset);
         Buffer = NtfsWriteUserBuffer(Ctx->Irp);
@@ -1254,7 +1682,10 @@ NtfsCommonSetInformation(PNTFS_IRP_CONTEXT Ctx)
     case FileAllocationInformation: {
         ULONGLONG NewSize = (ULONGLONG)((PFILE_END_OF_FILE_INFORMATION)Buffer)->EndOfFile.QuadPart;
         if (Fcb->FcbState & FCB_STATE_DIRECTORY) return STATUS_INVALID_DEVICE_REQUEST;
-        if (Fcb->DataCompressed) return STATUS_ACCESS_DENIED;
+        if (Fcb->DataCompressed) {
+            Status = NtfsDecompressFile(Vcb, Fcb);    /* resize makes it plain */
+            if (!NT_SUCCESS(Status)) return Status;
+        }
 
         KeEnterCriticalRegion();
         ExAcquireResourceExclusiveLite(&Fcb->Resource, TRUE);
@@ -1380,6 +1811,39 @@ NtfsCommonSetInformation(PNTFS_IRP_CONTEXT Ctx)
         ExReleaseResourceForThreadLite(&Fcb->Resource, ExGetCurrentResourceThread());
         KeLeaveCriticalRegion();
         return Status;
+    }
+    case FileLinkInformation: {
+        PFILE_LINK_INFORMATION li = (PFILE_LINK_INFORMATION)Buffer;
+        PFILE_OBJECT tfo = IrpSp->Parameters.SetFile.FileObject;
+        BOOLEAN replace = IrpSp->Parameters.SetFile.ReplaceIfExists;
+        ULONGLONG tparent;
+        PWCHAR nn; ULONG nl, i;
+        if (Fcb->FcbState & FCB_STATE_ROOT) return STATUS_INVALID_PARAMETER;
+        if (tfo != NULL) {
+            PNTFS_FCB tf = (PNTFS_FCB)tfo->FsContext;
+            if (tf == NULL || !(tf->FcbState & FCB_STATE_DIRECTORY)) return STATUS_INVALID_PARAMETER;
+            if (tf->Vcb != Vcb) return STATUS_NOT_SAME_DEVICE;
+            tparent = tf->MftRecord;
+            nn = tfo->FileName.Buffer; nl = tfo->FileName.Length / sizeof(WCHAR);
+        } else {
+            PNTFS_CCB tccb;
+            tparent = Fcb->MftRecord;       /* no target fo: link in a dir we must find */
+            /* same-directory link: the parent of the source's name */
+            nn = li->FileName; nl = li->FileNameLength / sizeof(WCHAR);
+            for (i = 0; i < nl; i++) if (nn[i] == L'\\') return STATUS_INVALID_PARAMETER;
+            tccb = NULL; (void)tccb;
+            /* resolve the source's parent directory from its $FILE_NAME */
+            {
+                PUCHAR r = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, Vcb->Geo.MftRecordSize, NTFS_TAG_BUF);
+                PATTRIBUTE_RECORD a;
+                if (!r) return STATUS_INSUFFICIENT_RESOURCES;
+                if (NT_SUCCESS(NtfsReadMftRecord(Vcb, Fcb->MftRecord, r)) &&
+                    (a = NtfsFindAttribute((PMFT_RECORD)r, ATTR_FILE_NAME, NULL, 0)) != NULL)
+                    tparent = ((PFILE_NAME_ATTR)NtfsResidentValue(a))->ParentDirectory & 0xFFFFFFFFFFFFULL;
+                ExFreePool(r);
+            }
+        }
+        return NtfsCreateHardLink(Vcb, Fcb, tparent, nn, nl, replace);
     }
     default:
         return STATUS_NOT_IMPLEMENTED;
